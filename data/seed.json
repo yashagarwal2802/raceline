@@ -1,0 +1,24 @@
+{
+  "team": [
+    { "id": "owner-1", "name": "Yash Agarwal", "role": "owner" }
+  ],
+  "products": [
+    { "id": "6205-2RS1", "partNumber": "6205-2RS1", "description": "Deep groove ball bearing, sealed both sides", "category": "Deep groove ball", "unit": "pcs", "stock": 84, "reorderLevel": 20, "location": "Rack A1", "sample": true },
+    { "id": "6304-2Z", "partNumber": "6304-2Z", "description": "Deep groove ball bearing, shielded both sides", "category": "Deep groove ball", "unit": "pcs", "stock": 46, "reorderLevel": 15, "location": "Rack A2", "sample": true },
+    { "id": "22210 E", "partNumber": "22210 E", "description": "Spherical roller bearing", "category": "Spherical roller", "unit": "pcs", "stock": 9, "reorderLevel": 10, "location": "Rack B1", "sample": true },
+    { "id": "NU 205 ECP", "partNumber": "NU 205 ECP", "description": "Cylindrical roller bearing, single row", "category": "Cylindrical roller", "unit": "pcs", "stock": 27, "reorderLevel": 12, "location": "Rack B3", "sample": true },
+    { "id": "32008 X/Q", "partNumber": "32008 X/Q", "description": "Tapered roller bearing, single row", "category": "Tapered roller", "unit": "pcs", "stock": 18, "reorderLevel": 10, "location": "Rack C1", "sample": true },
+    { "id": "51106", "partNumber": "51106", "description": "Single direction thrust ball bearing", "category": "Thrust ball", "unit": "pcs", "stock": 12, "reorderLevel": 8, "location": "Rack C4", "sample": true },
+    { "id": "6002-2RSH", "partNumber": "6002-2RSH", "description": "Deep groove ball bearing, sealed both sides", "category": "Deep groove ball", "unit": "pcs", "stock": 5, "reorderLevel": 15, "location": "Rack A1", "sample": true },
+    { "id": "6206-2RS1/C3", "partNumber": "6206-2RS1/C3", "description": "Deep groove ball bearing, C3 clearance", "category": "Deep groove ball", "unit": "pcs", "stock": 61, "reorderLevel": 20, "location": "Rack A3", "sample": true }
+  ],
+  "customers": [
+    { "id": "cust-1", "name": "Shree Balaji Bearing House", "contact": "98200 00001", "area": "Local", "creditPeriodDays": 30, "outstandingAmount": 0, "outstandingAsOf": null, "sample": true },
+    { "id": "cust-2", "name": "New Diamond Machinery Stores", "contact": "98200 00002", "area": "Local", "creditPeriodDays": 30, "outstandingAmount": 0, "outstandingAsOf": null, "sample": true },
+    { "id": "cust-3", "name": "Om Industrial Traders", "contact": "98200 00003", "area": "Out of town", "creditPeriodDays": 45, "outstandingAmount": 0, "outstandingAsOf": null, "sample": true }
+  ],
+  "orders": [],
+  "skfRequests": [],
+  "stockIns": [],
+  "skfWriteOffs": []
+}

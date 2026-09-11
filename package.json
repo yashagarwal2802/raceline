@@ -1,0 +1,16 @@
+{
+  "name": "raceline",
+  "version": "1.0.0",
+  "description": "RaceLine - Order & Stock Desk for SKF bearing distribution",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
