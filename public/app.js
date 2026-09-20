@@ -50,8 +50,17 @@
     return data;
   }
 
+  // For uploading a real Excel file — no Content-Type header, the browser
+  // sets the multipart boundary itself.
+  async function apiUpload(path, formData) {
+    const res = await fetch(path, { method: "POST", body: formData });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "Something went wrong.");
+    return data;
+  }
+
   // ---------- state ----------
-  let state = { team: [], products: [], customers: [], orders: [], skfRequests: [], stockIns: [], skfWriteOffs: [] };
+  let state = { team: [], products: [], customers: [], orders: [], skfRequests: [], stockIns: [], skfWriteOffs: [], otherRequests: [], otherStockIns: [], otherWriteOffs: [] };
   let identityId = localStorage.getItem("raceline_identity") || null;
   let activeTab = null;
   let cart = [];
@@ -69,6 +78,9 @@
   let showSkfRequestForm = false;
   let showStockInForm = false;
   let lastStockInResult = null;
+  let showOtherRequestForm = false;
+  let showOtherStockInForm = false;
+  let lastOtherStockInResult = null;
 
   const ROLE_LABEL = { owner: "Owner", "order-taker": "Order taker", biller: "Biller", dispatch: "Dispatch" };
   const TABS = {
@@ -78,6 +90,7 @@
       ["orders", "Orders"],
       ["stock", "Stock"],
       ["purchases", "Purchases"],
+      ["other-purchases", "Other purchases"],
       ["customers", "Customers"],
       ["team", "Team"],
     ],
@@ -94,6 +107,7 @@
       ["orders", "Orders"],
       ["stock", "Stock"],
       ["purchases", "Purchases"],
+      ["other-purchases", "Other purchases"],
     ],
   };
   const DEFAULT_TAB = { owner: "dashboard", "order-taker": "new-order", biller: "orders", dispatch: "orders" };
@@ -210,6 +224,7 @@
       orders: renderOrdersView,
       stock: renderStockView,
       purchases: renderPurchasesView,
+      "other-purchases": renderOtherPurchasesView,
       customers: renderCustomersView,
       team: renderTeamView,
     }[activeTab];
@@ -222,7 +237,7 @@
   }
 
   // ---------- Dashboard ----------
-  function renderDashboard() {
+  function renderDashboard(person) {
     const wrap = el(`<div></div>`);
     wrap.appendChild(el(`<div class="view-header"><h1>Dashboard</h1><div class="sub">${new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" })}</div></div>`));
 
@@ -286,7 +301,35 @@
     }
     wrap.appendChild(smPanel);
 
-    wrap.appendChild(el(`<div style="margin-top:14px;"><a class="btn small" href="/api/export" download="raceline-backup.json">Export backup (JSON)</a></div>`));
+    const backupRow = el(`<div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;"></div>`);
+    backupRow.appendChild(el(`<a class="btn small" href="/api/export" download="raceline-backup.json">Export backup (JSON)</a>`));
+    if (person && person.role === "owner") {
+      const restoreInput = el(`<input type="file" accept=".json" style="display:none;" />`);
+      const restoreBtn = el(`<button class="btn small ghost">Restore from backup…</button>`);
+      restoreBtn.addEventListener("click", () => restoreInput.click());
+      restoreInput.addEventListener("change", async () => {
+        const file = restoreInput.files[0];
+        if (!file) return;
+        if (!confirm("This replaces ALL current data (stock, customers, orders, everything) with this backup file's contents. This can't be undone. Continue?")) {
+          restoreInput.value = "";
+          return;
+        }
+        try {
+          const text = await file.text();
+          const parsed = JSON.parse(text);
+          await api("/api/restore", { method: "POST", body: parsed });
+          toast("Restored from backup.");
+          await loadState();
+        } catch (e) {
+          toast(e.message || "Could not restore that file.", true);
+        } finally {
+          restoreInput.value = "";
+        }
+      });
+      backupRow.appendChild(restoreBtn);
+      backupRow.appendChild(restoreInput);
+    }
+    wrap.appendChild(backupRow);
     return wrap;
   }
 
@@ -796,10 +839,13 @@
         <h2>Bulk import parts</h2>
         <div class="sub" style="margin-bottom:8px;">One part per line: <code class="mono">part number, description, category, unit, stock, reorder level, location</code></div>
         <textarea id="bi-text" rows="6" placeholder="6205-2RS1, Deep groove ball bearing, Deep groove ball, pcs, 84, 20, Rack A1"></textarea>
-        <button class="btn primary" style="margin-top:10px;">Import</button>
+        <button class="btn primary" id="bi-paste-btn" style="margin-top:10px;">Import</button>
+        <div class="sub" style="margin:16px 0 10px;border-top:1px solid var(--border);padding-top:12px;">— or upload an Excel file (.xlsx/.xls), e.g. exported from Tally —</div>
+        <input type="file" id="bi-file" accept=".xlsx,.xls" />
+        <button class="btn" id="bi-file-btn" style="margin-top:10px;display:block;">Upload file</button>
       </div>
     `);
-    $("button", panel).addEventListener("click", async () => {
+    $("#bi-paste-btn", panel).addEventListener("click", async () => {
       const lines = $("#bi-text", panel).value.split("\n").map((l) => l.trim()).filter(Boolean);
       const rows = lines.map((l) => {
         const [partNumber, description, category, unit, stock, reorderLevel, location] = l.split(",").map((s) => (s || "").trim());
@@ -813,6 +859,24 @@
         await loadState();
       } catch (e) {
         toast(e.message, true);
+      }
+    });
+    $("#bi-file-btn", panel).addEventListener("click", async () => {
+      const file = $("#bi-file", panel).files[0];
+      if (!file) return toast("Choose a file first.", true);
+      const fd = new FormData();
+      fd.append("file", file);
+      const btn = $("#bi-file-btn", panel);
+      btn.disabled = true;
+      try {
+        const res = await apiUpload("/api/products/import-excel", fd);
+        showBulkImportProducts = false;
+        toast(`Imported ${res.saved.length} part(s) from ${res.rowsRead} row(s).${res.errors.length ? " " + res.errors.length + " skipped." : ""}`);
+        await loadState();
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        btn.disabled = false;
       }
     });
     return panel;
@@ -971,10 +1035,13 @@
         <h2>Bulk import customers</h2>
         <div class="sub" style="margin-bottom:8px;">One customer per line: <code class="mono">name, contact, area</code></div>
         <textarea id="bic-text" rows="6" placeholder="Shree Balaji Bearing House, 98200 00001, Local"></textarea>
-        <button class="btn primary" style="margin-top:10px;">Import</button>
+        <button class="btn primary" id="bic-paste-btn" style="margin-top:10px;">Import</button>
+        <div class="sub" style="margin:16px 0 10px;border-top:1px solid var(--border);padding-top:12px;">— or upload an Excel file (.xlsx/.xls), e.g. exported from Tally —</div>
+        <input type="file" id="bic-file" accept=".xlsx,.xls" />
+        <button class="btn" id="bic-file-btn" style="margin-top:10px;display:block;">Upload file</button>
       </div>
     `);
-    $("button", panel).addEventListener("click", async () => {
+    $("#bic-paste-btn", panel).addEventListener("click", async () => {
       const lines = $("#bic-text", panel).value.split("\n").map((l) => l.trim()).filter(Boolean);
       const rows = lines.map((l) => {
         const [name, contact, area] = l.split(",").map((s) => (s || "").trim());
@@ -985,6 +1052,24 @@
       showBulkImportCustomers = false;
       toast(`Imported ${res.saved.length} customer(s).`);
       await loadState();
+    });
+    $("#bic-file-btn", panel).addEventListener("click", async () => {
+      const file = $("#bic-file", panel).files[0];
+      if (!file) return toast("Choose a file first.", true);
+      const fd = new FormData();
+      fd.append("file", file);
+      const btn = $("#bic-file-btn", panel);
+      btn.disabled = true;
+      try {
+        const res = await apiUpload("/api/customers/import-excel", fd);
+        showBulkImportCustomers = false;
+        toast(`Imported ${res.saved.length} customer(s) from ${res.rowsRead} row(s).`);
+        await loadState();
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        btn.disabled = false;
+      }
     });
     return panel;
   }
@@ -1302,6 +1387,303 @@
     entries.forEach((e) => {
       const summary = e.items.map((it) => `${it.partNumber} ×${it.qty}`).join(", ");
       panel.appendChild(el(`<div class="order-meta" style="padding:5px 0;"><strong>${e.type}</strong> · ${esc(e.by)} · ${relTime(e.date)} — ${esc(summary)}</div>`));
+    });
+    return panel;
+  }
+
+  // ---------- Other-supplier pending ledger (same FIFO logic, keyed by party+part) ----------
+  function otherPendingSummary() {
+    const byKey = {};
+    function ensure(party, pn, desc) {
+      const key = party + "||" + pn;
+      if (!byKey[key]) byKey[key] = { party, partNumber: pn, description: desc || "", requests: [], totalReceived: 0, totalWrittenOff: 0 };
+      return byKey[key];
+    }
+    state.otherRequests.forEach((r) => r.items.forEach((it) => ensure(r.party, it.partNumber, it.description).requests.push({ date: r.date, qty: it.qty })));
+    state.otherStockIns.forEach((s) => s.items.forEach((it) => (ensure(s.party, it.partNumber, it.description).totalReceived += it.qty)));
+    state.otherWriteOffs.forEach((w) => (ensure(w.party, w.partNumber, w.description).totalWrittenOff += w.qty));
+
+    const result = [];
+    Object.values(byKey).forEach((p) => {
+      const requests = p.requests.slice().sort((a, b) => new Date(a.date) - new Date(b.date));
+      let toConsume = p.totalReceived + p.totalWrittenOff;
+      let oldestSince = null;
+      let totalRequested = 0;
+      requests.forEach((r) => {
+        totalRequested += r.qty;
+        let remaining = r.qty;
+        if (toConsume > 0) {
+          const consumed = Math.min(toConsume, remaining);
+          toConsume -= consumed;
+          remaining -= consumed;
+        }
+        if (remaining > 0 && oldestSince === null) oldestSince = r.date;
+      });
+      const pending = Math.max(0, totalRequested - p.totalReceived - p.totalWrittenOff);
+      result.push({ party: p.party, partNumber: p.partNumber, description: p.description, requested: totalRequested, received: p.totalReceived, writtenOff: p.totalWrittenOff, pending, oldestSince: pending > 0 ? oldestSince : null });
+    });
+    return result.sort((a, b) => b.pending - a.pending || a.party.localeCompare(b.party));
+  }
+
+  function getKnownParties() {
+    const set = new Set();
+    state.otherRequests.forEach((r) => set.add(r.party));
+    state.otherStockIns.forEach((s) => set.add(s.party));
+    return [...set].sort();
+  }
+
+  // ---------- Purchases (other suppliers) ----------
+  function renderOtherPurchasesView(person) {
+    const wrap = el(`<div></div>`);
+    wrap.appendChild(el(`<div class="view-header"><h1>Other purchases</h1><div class="sub">Tracking orders placed with suppliers other than SKF — same catalog part numbers</div></div>`));
+
+    const canRequest = person.role === "owner";
+    const canReceive = person.role === "owner" || person.role === "dispatch";
+
+    const actionsRow = el(`<div class="section-actions"></div>`);
+    const reqBtn = el(`<button class="btn">+ Log request to a party</button>`);
+    const recvBtn = el(`<button class="btn primary">Log stock received</button>`);
+    if (canRequest) actionsRow.appendChild(reqBtn);
+    if (canReceive) actionsRow.appendChild(recvBtn);
+    wrap.appendChild(actionsRow);
+
+    const bodyHolder = el(`<div></div>`);
+    wrap.appendChild(bodyHolder);
+
+    function rerenderBody() {
+      bodyHolder.innerHTML = "";
+      if (canRequest && showOtherRequestForm) bodyHolder.appendChild(renderOtherRequestForm(person, () => { showOtherRequestForm = false; rerenderBody(); }));
+      if (canReceive && showOtherStockInForm) bodyHolder.appendChild(renderOtherStockInForm(person, () => { showOtherStockInForm = false; rerenderBody(); }));
+      if (lastOtherStockInResult) bodyHolder.appendChild(renderLastOtherStockInPanel());
+      bodyHolder.appendChild(renderOtherPendingPanel(person));
+      bodyHolder.appendChild(renderOtherActivityPanel());
+    }
+    reqBtn.addEventListener("click", () => {
+      showOtherRequestForm = !showOtherRequestForm;
+      showOtherStockInForm = false;
+      rerenderBody();
+    });
+    recvBtn.addEventListener("click", () => {
+      showOtherStockInForm = !showOtherStockInForm;
+      showOtherRequestForm = false;
+      rerenderBody();
+    });
+    rerenderBody();
+
+    return wrap;
+  }
+
+  function renderOtherRequestForm(person, onDone) {
+    const panel = el(`<div class="panel"><h2>Log a request to a party</h2><div class="sub" style="margin-bottom:8px;">What you're ordering by WhatsApp/phone, so RaceLine can track it.</div></div>`);
+    const knownParties = getKnownParties();
+    panel.appendChild(el(`
+      <div class="field">
+        <label>Party / supplier name</label>
+        <input type="text" id="oth-req-party" list="oth-party-list" placeholder="e.g. Bansal Bearings" />
+        <datalist id="oth-party-list">${knownParties.map((p) => `<option value="${esc(p)}"></option>`).join("")}</datalist>
+      </div>
+    `));
+
+    const tabsRow = el(`<div class="filter-row" style="margin-top:10px;"></div>`);
+    const manualChip = el(`<button class="chip active">Pick parts</button>`);
+    const excelChip = el(`<button class="chip">Upload Excel</button>`);
+    tabsRow.appendChild(manualChip);
+    tabsRow.appendChild(excelChip);
+    panel.appendChild(tabsRow);
+
+    const manualSection = el(`<div style="margin-top:10px;"></div>`);
+    const builder = createItemBuilder();
+    manualSection.appendChild(builder.el);
+    manualSection.appendChild(el(`<div class="field" style="margin-top:10px;"><label>Note (optional)</label><textarea id="oth-req-note" placeholder="e.g. sent via WhatsApp"></textarea></div>`));
+    const manualBtn = el(`<button class="btn primary" style="margin-top:12px;">Log request</button>`);
+    manualSection.appendChild(manualBtn);
+
+    const excelSection = el(`<div style="margin-top:10px;" hidden></div>`);
+    excelSection.appendChild(el(`<div class="sub" style="margin-bottom:8px;">Upload the Excel sheet you're sending/sent this party, listing part numbers and quantities.</div>`));
+    const fileInput = el(`<input type="file" id="oth-req-file" accept=".xlsx,.xls" />`);
+    excelSection.appendChild(fileInput);
+    const excelBtn = el(`<button class="btn primary" style="margin-top:12px;display:block;">Upload &amp; log request</button>`);
+    excelSection.appendChild(excelBtn);
+
+    panel.appendChild(manualSection);
+    panel.appendChild(excelSection);
+
+    manualChip.addEventListener("click", () => {
+      manualChip.classList.add("active");
+      excelChip.classList.remove("active");
+      manualSection.hidden = false;
+      excelSection.hidden = true;
+    });
+    excelChip.addEventListener("click", () => {
+      excelChip.classList.add("active");
+      manualChip.classList.remove("active");
+      excelSection.hidden = false;
+      manualSection.hidden = true;
+    });
+
+    manualBtn.addEventListener("click", async () => {
+      const party = $("#oth-req-party", panel).value.trim();
+      if (!party) return toast("Enter a party/supplier name.", true);
+      const items = builder.getItems();
+      if (items.length === 0) return toast("Add at least one part.", true);
+      try {
+        await api("/api/other-requests", { method: "POST", body: { party, items, loggedBy: person.name, note: $("#oth-req-note", panel).value } });
+        toast("Request logged.");
+        onDone();
+        await loadState();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    });
+
+    excelBtn.addEventListener("click", async () => {
+      const party = $("#oth-req-party", panel).value.trim();
+      if (!party) return toast("Enter a party/supplier name.", true);
+      const file = fileInput.files[0];
+      if (!file) return toast("Choose an Excel file first.", true);
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("party", party);
+      fd.append("loggedBy", person.name);
+      excelBtn.disabled = true;
+      try {
+        const res = await apiUpload("/api/other-requests/import-excel", fd);
+        toast(`Request logged from ${res.rowsRead} row(s).`);
+        onDone();
+        await loadState();
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        excelBtn.disabled = false;
+      }
+    });
+
+    return panel;
+  }
+
+  function renderOtherStockInForm(person, onDone) {
+    const panel = el(`<div class="panel"><h2>Log stock received</h2><div class="sub" style="margin-bottom:8px;">What actually arrived from another party today.</div></div>`);
+    const knownParties = getKnownParties();
+    panel.appendChild(el(`
+      <div class="field">
+        <label>Party / supplier name</label>
+        <input type="text" id="oth-in-party" list="oth-party-list-2" placeholder="e.g. Bansal Bearings" />
+        <datalist id="oth-party-list-2">${knownParties.map((p) => `<option value="${esc(p)}"></option>`).join("")}</datalist>
+      </div>
+    `));
+    const builder = createItemBuilder();
+    panel.appendChild(builder.el);
+    panel.appendChild(el(`<div class="field" style="margin-top:10px;"><label>Note (optional)</label><textarea id="oth-in-note" placeholder="e.g. partial delivery, balance pending"></textarea></div>`));
+    const btn = el(`<button class="btn primary" style="margin-top:12px;">Log receipt</button>`);
+    panel.appendChild(btn);
+    btn.addEventListener("click", async () => {
+      const party = $("#oth-in-party", panel).value.trim();
+      if (!party) return toast("Enter a party/supplier name.", true);
+      const items = builder.getItems();
+      if (items.length === 0) return toast("Add at least one part.", true);
+      try {
+        const res = await api("/api/other-stock-in", { method: "POST", body: { party, items, receivedBy: person.name, note: $("#oth-in-note", panel).value } });
+        lastOtherStockInResult = res;
+        toast("Stock received logged.");
+        onDone();
+        await loadState();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    });
+    return panel;
+  }
+
+  function renderLastOtherStockInPanel() {
+    const panel = el(`<div class="panel"></div>`);
+    const header = el(`<div style="display:flex;justify-content:space-between;align-items:baseline;"><h2>Just received — who to fulfill first</h2></div>`);
+    const closeBtn = el(`<button class="link-btn">Dismiss</button>`);
+    closeBtn.addEventListener("click", () => {
+      lastOtherStockInResult = null;
+      render();
+    });
+    header.appendChild(closeBtn);
+    panel.appendChild(header);
+    lastOtherStockInResult.allocations.forEach((a) => {
+      const block = el(`<div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);"></div>`);
+      block.appendChild(el(`<div><span class="mono">${esc(a.partNumber)}</span> — received ${a.qtyReceived}, ${esc(a.description)}</div>`));
+      if (a.covered.length === 0) {
+        block.appendChild(el(`<div class="empty" style="padding:6px 0;">No pending customer orders for this part.</div>`));
+      } else {
+        a.covered.forEach((c) => {
+          block.appendChild(el(`<div class="order-meta">→ ${esc(c.customerName)} (${c.status}, ordered ${relTime(c.takenAt)}) — covers ${c.covered} of ${c.qty}</div>`));
+        });
+      }
+      if (a.leftover > 0) block.appendChild(el(`<div class="order-meta" style="color:var(--success);">${a.leftover} left over after covering pending orders.</div>`));
+      panel.appendChild(block);
+    });
+    return panel;
+  }
+
+  function renderOtherPendingPanel(person) {
+    const panel = el(`<div class="panel"><h2>Pending from other parties</h2></div>`);
+    const rows = otherPendingSummary().filter((r) => r.pending > 0 || r.requested > 0);
+    if (rows.length === 0) {
+      panel.appendChild(el(`<div class="empty">No requests logged yet.</div>`));
+      return panel;
+    }
+    const tw = el(`<div class="table-wrap"><table class="data"><thead><tr>
+      <th>Party</th><th>Part number</th><th>Requested</th><th>Received</th><th>Written off</th><th>Pending</th><th>Outstanding since</th>${person.role === "owner" ? "<th></th>" : ""}
+    </tr></thead><tbody></tbody></table></div>`);
+    const tbody = $("tbody", tw);
+    rows.forEach((r) => {
+      const tr = el(`<tr>
+        <td>${esc(r.party)}</td>
+        <td class="mono">${esc(r.partNumber)}</td>
+        <td class="mono">${r.requested}</td>
+        <td class="mono">${r.received}</td>
+        <td class="mono">${r.writtenOff}</td>
+        <td class="mono">${r.pending > 0 ? `<span class="stock-dot low"></span>` : ""}${r.pending}</td>
+        <td>${r.oldestSince ? relTime(r.oldestSince) : "—"}</td>
+      </tr>`);
+      if (person.role === "owner") {
+        const td = el(`<td></td>`);
+        if (r.pending > 0) {
+          const btn = el(`<button class="btn small danger">Write off</button>`);
+          btn.addEventListener("click", async () => {
+            const qtyStr = prompt(`Write off how many units of ${r.partNumber} from ${r.party}? (pending: ${r.pending})`, String(r.pending));
+            if (qtyStr === null) return;
+            const qty = Number(qtyStr);
+            if (!qty || qty <= 0) return toast("Enter a valid quantity.", true);
+            const note = prompt("Reason (optional):", "") || "";
+            try {
+              await api("/api/other-writeoffs", { method: "POST", body: { party: r.party, partNumber: r.partNumber, qty, note, writtenOffBy: person.name } });
+              toast("Written off.");
+              await loadState();
+            } catch (e) {
+              toast(e.message, true);
+            }
+          });
+          td.appendChild(btn);
+        }
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    });
+    panel.appendChild(tw);
+    return panel;
+  }
+
+  function renderOtherActivityPanel() {
+    const panel = el(`<div class="panel"><h2>Recent activity</h2></div>`);
+    const entries = [
+      ...state.otherRequests.map((r) => ({ type: "Requested", party: r.party, date: r.date, by: r.loggedBy, items: r.items })),
+      ...state.otherStockIns.map((s) => ({ type: "Received", party: s.party, date: s.date, by: s.receivedBy, items: s.items })),
+    ]
+      .sort((a, b) => new Date(b.date) - new Date(a.date))
+      .slice(0, 8);
+    if (entries.length === 0) {
+      panel.appendChild(el(`<div class="empty">Nothing logged yet.</div>`));
+      return panel;
+    }
+    entries.forEach((e) => {
+      const summary = e.items.map((it) => `${it.partNumber} ×${it.qty}`).join(", ");
+      panel.appendChild(el(`<div class="order-meta" style="padding:5px 0;"><strong>${e.type}</strong> · ${esc(e.party)} · ${esc(e.by)} · ${relTime(e.date)} — ${esc(summary)}</div>`));
     });
     return panel;
   }
