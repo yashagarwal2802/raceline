@@ -7,6 +7,29 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const multer = require("multer");
+const XLSX = require("xlsx");
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+
+// Reads the first sheet of an uploaded .xlsx/.xls file into plain row objects.
+function parseExcelRows(buffer) {
+  const workbook = XLSX.read(buffer, { type: "buffer" });
+  const sheetName = workbook.SheetNames[0];
+  const sheet = workbook.Sheets[sheetName];
+  return XLSX.utils.sheet_to_json(sheet, { defval: "" });
+}
+
+// Looks up a value in a spreadsheet row by trying several possible column
+// header spellings, since real-world exports never agree on header names.
+function pick(row, ...aliases) {
+  const keys = Object.keys(row);
+  for (const alias of aliases) {
+    const found = keys.find((k) => k.trim().toLowerCase() === alias.trim().toLowerCase());
+    if (found !== undefined && row[found] !== "") return row[found];
+  }
+  return "";
+}
 
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, "data", "data.json");
@@ -21,7 +44,12 @@ if (!fs.existsSync(DATA_FILE)) {
 }
 
 function readData() {
-  return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+  const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+  // Backfill for data files saved before "other supplier" purchases existed.
+  if (!Array.isArray(data.otherRequests)) data.otherRequests = [];
+  if (!Array.isArray(data.otherStockIns)) data.otherStockIns = [];
+  if (!Array.isArray(data.otherWriteOffs)) data.otherWriteOffs = [];
+  return data;
 }
 
 let writeQueue = Promise.resolve();
@@ -57,6 +85,24 @@ app.get("/api/state", (req, res) => {
 app.get("/api/export", (req, res) => {
   res.setHeader("Content-Disposition", 'attachment; filename="raceline-backup.json"');
   res.json(readData());
+});
+
+// Restores the whole dataset from a previously-exported backup file — used
+// to carry real data across a redeploy on a host without a persistent disk
+// (a fresh deploy resets data/data.json to the seed file).
+app.post("/api/restore", async (req, res) => {
+  const incoming = req.body;
+  if (!incoming || typeof incoming !== "object" || !Array.isArray(incoming.team) || !Array.isArray(incoming.products)) {
+    return res.status(400).json({ error: "That doesn't look like a RaceLine backup file." });
+  }
+  await withData((data) => {
+    for (const key of Object.keys(data)) delete data[key];
+    Object.assign(data, incoming);
+    if (!Array.isArray(data.otherRequests)) data.otherRequests = [];
+    if (!Array.isArray(data.otherStockIns)) data.otherStockIns = [];
+    if (!Array.isArray(data.otherWriteOffs)) data.otherWriteOffs = [];
+  });
+  res.json({ ok: true });
 });
 
 // ---- team ----
@@ -170,6 +216,47 @@ app.delete("/api/products/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
+// Bulk-import products from an uploaded Excel file (.xlsx/.xls). Tries a
+// handful of common header spellings so real-world exports don't need
+// reformatting first.
+app.post("/api/products/import-excel", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded." });
+  let rows;
+  try {
+    rows = parseExcelRows(req.file.buffer);
+  } catch (e) {
+    return res.status(400).json({ error: "Could not read that file. Make sure it's a .xlsx or .xls file." });
+  }
+  const errors = [];
+  const saved = await withData((data) => {
+    const out = [];
+    for (const row of rows) {
+      const partNumber = String(pick(row, "Part Number", "Part No", "PartNo", "SKU", "Item Code", "Item")).trim();
+      if (!partNumber) continue;
+      const p = normalizeProduct({
+        partNumber,
+        description: pick(row, "Description", "Item Name", "Name"),
+        category: pick(row, "Category", "Group"),
+        unit: pick(row, "Unit", "UOM"),
+        stock: pick(row, "Stock", "Qty", "Quantity", "Closing Stock", "Closing Balance"),
+        reorderLevel: pick(row, "Reorder Level", "Reorder", "Min Stock"),
+        location: pick(row, "Location", "Godown", "Rack"),
+      });
+      const existing = data.products.find((x) => x.id === p.id);
+      if (existing) {
+        Object.assign(existing, p, { sample: false });
+        out.push(existing);
+      } else {
+        data.products.push(p);
+        out.push(p);
+      }
+    }
+    return out;
+  });
+  if (saved.length === 0) errors.push("No rows with a recognizable part number were found in that file.");
+  res.json({ saved, errors, rowsRead: rows.length });
+});
+
 app.post("/api/products/clear-samples", async (req, res) => {
   const removed = await withData((data) => {
     const before = data.products.length;
@@ -236,6 +323,35 @@ app.post("/api/customers/clear-samples", async (req, res) => {
     return before - data.customers.length;
   });
   res.json({ removed });
+});
+
+// Bulk-import customers from an uploaded Excel file.
+app.post("/api/customers/import-excel", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded." });
+  let rows;
+  try {
+    rows = parseExcelRows(req.file.buffer);
+  } catch (e) {
+    return res.status(400).json({ error: "Could not read that file. Make sure it's a .xlsx or .xls file." });
+  }
+  const saved = await withData((data) => {
+    const out = [];
+    for (const row of rows) {
+      const name = String(pick(row, "Name", "Customer Name", "Party", "Party Name")).trim();
+      if (!name) continue;
+      const c = normalizeCustomer({
+        name,
+        contact: pick(row, "Contact", "Phone", "Mobile"),
+        area: pick(row, "Area", "City", "Location"),
+        creditPeriodDays: pick(row, "Credit Period", "Credit Days"),
+        outstandingAmount: pick(row, "Outstanding", "Outstanding Amount", "Closing Balance", "Balance"),
+      });
+      data.customers.push(c);
+      out.push(c);
+    }
+    return out;
+  });
+  res.json({ saved, rowsRead: rows.length });
 });
 
 // ---- orders ----
@@ -416,6 +532,104 @@ app.post("/api/skf-writeoffs", async (req, res) => {
   });
   if (result.error) return res.status(400).json({ error: result.error });
   res.json(result.writeOff);
+});
+
+// ---- Other-supplier purchases ----
+// Same "no PO numbers, running ledger" pattern as SKF above, but for any
+// other party (they sell the same catalog part numbers as SKF). Kept as
+// entirely separate collections/endpoints from the SKF ones so the
+// existing SKF flow can't be affected by this.
+app.post("/api/other-requests", async (req, res) => {
+  const { party, items, loggedBy, note } = req.body || {};
+  const p = String(party || "").trim();
+  const result = await withData((data) => {
+    if (!p) return { error: "Enter a supplier/party name." };
+    const lineItems = normalizeLineItems(data, items);
+    if (lineItems.length === 0) return { error: "Add at least one part number." };
+    const request = { id: newId("othreq"), party: p, date: nowIso(), loggedBy: loggedBy || "Unknown", note: (note || "").trim(), items: lineItems };
+    data.otherRequests.push(request);
+    return { request };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(result.request);
+});
+
+app.post("/api/other-stock-in", async (req, res) => {
+  const { party, items, receivedBy, note } = req.body || {};
+  const p = String(party || "").trim();
+  const result = await withData((data) => {
+    if (!p) return { error: "Enter a supplier/party name." };
+    const lineItems = normalizeLineItems(data, items);
+    if (lineItems.length === 0) return { error: "Add at least one part number." };
+    const allocations = [];
+    for (const item of lineItems) {
+      const product = data.products.find((x) => x.id === item.partNumber);
+      product.stock += item.qty;
+      product.sample = false;
+      const demand = pendingDemand(data, item.partNumber);
+      let remaining = item.qty;
+      const covered = [];
+      for (const d of demand) {
+        if (remaining <= 0) break;
+        const take = Math.min(remaining, d.qty);
+        remaining -= take;
+        covered.push({ ...d, covered: take });
+      }
+      allocations.push({ partNumber: item.partNumber, description: item.description, qtyReceived: item.qty, covered, leftover: remaining });
+    }
+    const stockIn = { id: newId("othstockin"), party: p, date: nowIso(), receivedBy: receivedBy || "Unknown", note: (note || "").trim(), items: lineItems };
+    data.otherStockIns.push(stockIn);
+    return { stockIn, allocations };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(result);
+});
+
+app.post("/api/other-writeoffs", async (req, res) => {
+  const { party, partNumber, qty, note, writtenOffBy } = req.body || {};
+  const p = String(party || "").trim();
+  const result = await withData((data) => {
+    if (!p) return { error: "Enter a supplier/party name." };
+    const product = data.products.find((x) => x.id === partNumber);
+    if (!product) return { error: "Unknown part number." };
+    const q = Number(qty) || 0;
+    if (q <= 0) return { error: "Enter a quantity to write off." };
+    const writeOff = { id: newId("othwo"), party: p, date: nowIso(), partNumber, description: product.description, qty: q, note: (note || "").trim(), writtenOffBy: writtenOffBy || "Unknown" };
+    data.otherWriteOffs.push(writeOff);
+    return { writeOff };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(result.writeOff);
+});
+
+// Bulk-import an "other supplier" request straight from an emailed/WhatsApp
+// Excel sheet — one file becomes one logged request against that party.
+app.post("/api/other-requests/import-excel", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded." });
+  const party = String((req.body && req.body.party) || "").trim();
+  if (!party) return res.status(400).json({ error: "Enter a supplier/party name." });
+  let rows;
+  try {
+    rows = parseExcelRows(req.file.buffer);
+  } catch (e) {
+    return res.status(400).json({ error: "Could not read that file. Make sure it's a .xlsx or .xls file." });
+  }
+  const result = await withData((data) => {
+    const items = [];
+    for (const row of rows) {
+      const partNumber = String(pick(row, "Part Number", "Part No", "PartNo", "SKU", "Item Code", "Item")).trim();
+      const qty = Number(pick(row, "Qty", "Quantity", "Order Qty")) || 0;
+      if (!partNumber || qty <= 0) continue;
+      items.push({ partNumber, qty });
+    }
+    const lineItems = normalizeLineItems(data, items);
+    if (lineItems.length === 0) return { error: "No valid part numbers with quantities found in that file." };
+    const request = { id: newId("othreq"), party, date: nowIso(), loggedBy: (req.body && req.body.loggedBy) || "Unknown", note: "Imported from Excel", items: lineItems };
+    data.otherRequests.push(request);
+    return { request, rowsRead: rows.length };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(result);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
