@@ -1255,12 +1255,45 @@
 
   function renderSkfRequestForm(person, onDone) {
     const panel = el(`<div class="panel"><h2>Log a request to SKF</h2><div class="sub" style="margin-bottom:8px;">What you're emailing them, so RaceLine can track it.</div></div>`);
+
+    const tabsRow = el(`<div class="filter-row"></div>`);
+    const manualChip = el(`<button class="chip active">Pick parts</button>`);
+    const excelChip = el(`<button class="chip">Upload Excel</button>`);
+    tabsRow.appendChild(manualChip);
+    tabsRow.appendChild(excelChip);
+    panel.appendChild(tabsRow);
+
+    const manualSection = el(`<div style="margin-top:10px;"></div>`);
     const builder = createItemBuilder();
-    panel.appendChild(builder.el);
-    panel.appendChild(el(`<div class="field" style="margin-top:10px;"><label>Note (optional)</label><textarea id="skf-req-note" placeholder="e.g. sent via email to SKF Pune depot"></textarea></div>`));
-    const btn = el(`<button class="btn primary" style="margin-top:12px;">Log request</button>`);
-    panel.appendChild(btn);
-    btn.addEventListener("click", async () => {
+    manualSection.appendChild(builder.el);
+    manualSection.appendChild(el(`<div class="field" style="margin-top:10px;"><label>Note (optional)</label><textarea id="skf-req-note" placeholder="e.g. sent via email to SKF Pune depot"></textarea></div>`));
+    const manualBtn = el(`<button class="btn primary" style="margin-top:12px;">Log request</button>`);
+    manualSection.appendChild(manualBtn);
+
+    const excelSection = el(`<div style="margin-top:10px;" hidden></div>`);
+    excelSection.appendChild(el(`<div class="sub" style="margin-bottom:8px;">Upload the Excel sheet you're sending/sent SKF, listing part numbers and quantities.</div>`));
+    const fileInput = el(`<input type="file" id="skf-req-file" accept=".xlsx,.xls" />`);
+    excelSection.appendChild(fileInput);
+    const excelBtn = el(`<button class="btn primary" style="margin-top:12px;display:block;">Upload &amp; log request</button>`);
+    excelSection.appendChild(excelBtn);
+
+    panel.appendChild(manualSection);
+    panel.appendChild(excelSection);
+
+    manualChip.addEventListener("click", () => {
+      manualChip.classList.add("active");
+      excelChip.classList.remove("active");
+      manualSection.hidden = false;
+      excelSection.hidden = true;
+    });
+    excelChip.addEventListener("click", () => {
+      excelChip.classList.add("active");
+      manualChip.classList.remove("active");
+      excelSection.hidden = false;
+      manualSection.hidden = true;
+    });
+
+    manualBtn.addEventListener("click", async () => {
       const items = builder.getItems();
       if (items.length === 0) return toast("Add at least one part.", true);
       try {
@@ -1272,6 +1305,26 @@
         toast(e.message, true);
       }
     });
+
+    excelBtn.addEventListener("click", async () => {
+      const file = fileInput.files[0];
+      if (!file) return toast("Choose an Excel file first.", true);
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("loggedBy", person.name);
+      excelBtn.disabled = true;
+      try {
+        const res = await apiUpload("/api/skf-requests/import-excel", fd);
+        toast(`Request logged from ${res.rowsRead} row(s).`);
+        onDone();
+        await loadState();
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        excelBtn.disabled = false;
+      }
+    });
+
     return panel;
   }
 
