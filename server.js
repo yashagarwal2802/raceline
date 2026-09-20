@@ -490,6 +490,35 @@ app.post("/api/skf-requests", async (req, res) => {
   res.json(result.request);
 });
 
+// Bulk-import a request to SKF straight from the Excel sheet you're about
+// to email them — same idea as the other-supplier Excel import, one file
+// becomes one logged request.
+app.post("/api/skf-requests/import-excel", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded." });
+  let rows;
+  try {
+    rows = parseExcelRows(req.file.buffer);
+  } catch (e) {
+    return res.status(400).json({ error: "Could not read that file. Make sure it's a .xlsx or .xls file." });
+  }
+  const result = await withData((data) => {
+    const items = [];
+    for (const row of rows) {
+      const partNumber = String(pick(row, "Part Number", "Part No", "PartNo", "SKU", "Item Code", "Item")).trim();
+      const qty = Number(pick(row, "Qty", "Quantity", "Order Qty")) || 0;
+      if (!partNumber || qty <= 0) continue;
+      items.push({ partNumber, qty });
+    }
+    const lineItems = normalizeLineItems(data, items);
+    if (lineItems.length === 0) return { error: "No valid part numbers with quantities found in that file." };
+    const request = { id: newId("skfreq"), date: nowIso(), loggedBy: (req.body && req.body.loggedBy) || "Unknown", note: "Imported from Excel", items: lineItems };
+    data.skfRequests.push(request);
+    return { request, rowsRead: rows.length };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(result);
+});
+
 app.post("/api/stock-in", async (req, res) => {
   const { items, receivedBy, note } = req.body || {};
   const result = await withData((data) => {
