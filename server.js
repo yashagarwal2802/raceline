@@ -496,6 +496,40 @@ async function fetchNewVouchersWithItems(alreadySyncedGuids) {
   return newHeaders.map((h) => ({ ...h, items: itemsMap[h.guid] || [], itemsNeededRetry: missing.some((m) => m.guid === h.guid) }));
 }
 
+// Diagnostic: shows, in one short summary, which Tally stock item names DO
+// and DON'T match a RaceLine part number, without dumping every voucher's
+// full detail. Fetches the same not-yet-synced vouchers as the real sync
+// preview, then groups their line items by stock item name so repeats only
+// count once — much shorter to read than scrolling through 182 vouchers.
+app.get("/api/tally-match-test", async (req, res) => {
+  try {
+    const data = readData();
+    const vouchers = await fetchNewVouchersWithItems(data.tallySyncedVoucherGuids);
+    const seen = new Map();
+    for (const v of vouchers) {
+      for (const item of v.items) {
+        const key = item.stockItemName;
+        if (!seen.has(key)) seen.set(key, { name: key, count: 0, matched: !!findProductForStockItem(data, key) });
+        seen.get(key).count += 1;
+      }
+    }
+    const all = Array.from(seen.values());
+    const unmatched = all.filter((x) => !x.matched).sort((a, b) => b.count - a.count);
+    const matched = all.filter((x) => x.matched);
+    res.json({
+      ok: true,
+      totalVouchersChecked: vouchers.length,
+      distinctStockItemNames: all.length,
+      matchedDistinctCount: matched.length,
+      unmatchedDistinctCount: unmatched.length,
+      unmatchedSample: unmatched.slice(0, 25),
+      matchedSample: matched.slice(0, 8),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
 // Diagnostic: tries fetching item-level detail for the same first group of
 // not-yet-synced vouchers using several different batch sizes (2, 5, 10, 20),
 // and reports how many of each batch actually came back with items filled
