@@ -188,6 +188,31 @@ app.get("/api/tally-test", (req, res) => {
   socket.connect(port, host);
 });
 
+// A step further than /api/tally-test: actually sends an HTTP request (Tally's
+// XML/ODBC gateway speaks HTTP under the hood) and shows what comes back, so
+// we can tell whether this is genuinely talking to Tally versus something
+// else answering on that port. Visit directly in a browser to run it.
+app.get("/api/tally-http-test", (req, res) => {
+  const host = String(req.query.host || "v60020.22164.tallyprimecloud.in");
+  const port = Number(req.query.port) || 9537;
+  const http = require("http");
+  const start = Date.now();
+  const request = http.get({ host, port, path: "/", timeout: 8000 }, (resp) => {
+    let body = "";
+    resp.on("data", (chunk) => { if (body.length < 2000) body += chunk; });
+    resp.on("end", () => {
+      res.json({ host, port, ms: Date.now() - start, ok: true, statusCode: resp.statusCode, headers: resp.headers, bodyPreview: body.slice(0, 2000) });
+    });
+  });
+  request.on("timeout", () => {
+    request.destroy();
+    res.json({ host, port, ms: Date.now() - start, ok: false, message: "Connected at the TCP level but no HTTP response came back in time." });
+  });
+  request.on("error", (err) => {
+    res.json({ host, port, ms: Date.now() - start, ok: false, message: `Request error: ${err.message}` });
+  });
+});
+
 // Shown on the picker screen before anyone is logged in — no sensitive data.
 app.get("/api/team-roster", (req, res) => {
   const data = readData();
