@@ -247,6 +247,19 @@ function parseTallyQty(qtyStr) {
   return m ? Math.abs(parseFloat(m[1])) : 0;
 }
 
+// Tally's XML export encodes some punctuation as XML entities right inside
+// names (e.g. an apostrophe in an item name comes through as the literal
+// text "&apos;" instead of "'"). Decodes the common ones so part numbers
+// and names look right instead of showing raw entity codes.
+function decodeXmlEntities(s) {
+  return String(s || "")
+    .replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
 // Turns Tally's raw XML into a plain-JS list of vouchers with their line
 // items. Deliberately simple regex parsing rather than a full XML parser —
 // Tally's export is flat enough that this is reliable and needs no new
@@ -272,10 +285,10 @@ function parseTallyVouchers(xmlBody) {
       const qtyStr = (beforeBatch.match(/<ACTUALQTY[^>]*>([\s\S]*?)<\/ACTUALQTY>/) || [])[1];
       if (!stockItemName) continue;
       const qty = parseTallyQty(qtyStr);
-      if (qty > 0) items.push({ stockItemName: stockItemName.trim(), qty });
+      if (qty > 0) items.push({ stockItemName: decodeXmlEntities(stockItemName).trim(), qty });
     }
     vouchers.push({
-      guid, voucherType, voucherNumber: voucherNumber || "", party: (party || "").trim(),
+      guid, voucherType, voucherNumber: voucherNumber || "", party: decodeXmlEntities(party || "").trim(),
       date: dateRaw ? `${dateRaw.slice(0, 4)}-${dateRaw.slice(4, 6)}-${dateRaw.slice(6, 8)}` : "",
       items,
     });
@@ -412,7 +425,7 @@ function parseVoucherHeaders(xmlBody) {
     const dateRaw = (block.match(/<DATE[^>]*>([\s\S]*?)<\/DATE>/) || [])[1];
     if (!guid || !voucherType) continue;
     out.push({
-      guid, voucherType, voucherNumber: voucherNumber || "", party: (party || "").trim(),
+      guid, voucherType, voucherNumber: voucherNumber || "", party: decodeXmlEntities(party || "").trim(),
       date: dateRaw ? `${dateRaw.slice(0, 4)}-${dateRaw.slice(4, 6)}-${dateRaw.slice(6, 8)}` : "",
     });
   }
@@ -433,7 +446,7 @@ function parseVoucherItemsOnly(xmlBody) {
       const qtyStr = (beforeBatch.match(/<ACTUALQTY[^>]*>([\s\S]*?)<\/ACTUALQTY>/) || [])[1];
       if (!stockItemName) continue;
       const qty = parseTallyQty(qtyStr);
-      if (qty > 0) items.push({ stockItemName: stockItemName.trim(), qty });
+      if (qty > 0) items.push({ stockItemName: decodeXmlEntities(stockItemName).trim(), qty });
     }
     map[guid] = items;
   }
@@ -574,9 +587,13 @@ function parseStockItems(xmlBody) {
   const out = [];
   for (const block of blocks) {
     const name = (block.match(/<NAME>([\s\S]*?)<\/NAME>/) || [])[1];
-    const balRaw = (block.match(/<CLOSINGBALANCE>([\s\S]*?)<\/CLOSINGBALANCE>/) || [])[1];
+    // Tally's actual tag is <CLOSINGBALANCE TYPE="Quantity">...</CLOSINGBALANCE>
+    // — it always carries that TYPE attribute, so the regex needs to allow
+    // for it (a bare <CLOSINGBALANCE> with no attributes never matches,
+    // which is why every item was silently reading as 0 stock before).
+    const balRaw = (block.match(/<CLOSINGBALANCE[^>]*>([\s\S]*?)<\/CLOSINGBALANCE>/) || [])[1];
     if (!name) continue;
-    out.push({ name: name.trim(), closingBalance: parseTallyQty(balRaw) });
+    out.push({ name: decodeXmlEntities(name).trim(), closingBalance: parseTallyQty(balRaw) });
   }
   return out;
 }
