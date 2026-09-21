@@ -213,6 +213,49 @@ app.get("/api/tally-http-test", (req, res) => {
   });
 });
 
+// Asks Tally for the actual list of companies it has loaded, so we can
+// confirm "BMA" is spelled exactly the way Tally has it before the real
+// sync is built around that name. Visit directly in a browser to run it.
+app.get("/api/tally-companies-test", (req, res) => {
+  const host = String(req.query.host || "v60020.22164.tallyprimecloud.in");
+  const port = Number(req.query.port) || 9537;
+  const http = require("http");
+  const xmlRequest = [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<TALLYREQUEST>Export Data</TALLYREQUEST>",
+    "</HEADER>",
+    "<BODY>",
+    "<EXPORTDATA>",
+    "<REQUESTDESC>",
+    "<REPORTNAME>List of Companies</REPORTNAME>",
+    "</REQUESTDESC>",
+    "</EXPORTDATA>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+  const start = Date.now();
+  const request = http.request(
+    { host, port, path: "/", method: "POST", headers: { "Content-Type": "text/xml", "Content-Length": Buffer.byteLength(xmlRequest) }, timeout: 10000 },
+    (resp) => {
+      let body = "";
+      resp.on("data", (chunk) => { if (body.length < 8000) body += chunk; });
+      resp.on("end", () => {
+        res.json({ host, port, ms: Date.now() - start, ok: true, statusCode: resp.statusCode, bodyPreview: body.slice(0, 8000) });
+      });
+    }
+  );
+  request.on("timeout", () => {
+    request.destroy();
+    res.json({ host, port, ms: Date.now() - start, ok: false, message: "Timed out waiting for a response." });
+  });
+  request.on("error", (err) => {
+    res.json({ host, port, ms: Date.now() - start, ok: false, message: `Request error: ${err.message}` });
+  });
+  request.write(xmlRequest);
+  request.end();
+});
+
 // Shown on the picker screen before anyone is logged in — no sensitive data.
 app.get("/api/team-roster", (req, res) => {
   const data = readData();
