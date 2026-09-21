@@ -324,6 +324,144 @@ function computeSyncPlan(data, vouchers, { apply } = {}) {
   return { totalVouchersChecked: vouchers.length, newVouchersFound: newVouchers.length, purchases, sales, unmatched };
 }
 
+// The date-range filter turned out not to work reliably against Tally's
+// plain voucher collection (it silently returned everything regardless of
+// the range asked for) — and separately, asking for item-level detail on
+// ALL vouchers in one big request came back mostly empty even though the
+// data is there. Splitting into two small, reliable steps fixes both:
+// 1) fetch every voucher's header info (cheap, proven reliable), 2) fetch
+// item-level detail in small batches (~20 at a time, by exact ID) only for
+// vouchers we haven't already synced.
+
+function buildVoucherHeadersXml({ company = TALLY_COMPANY } = {}) {
+  return [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>Export</TALLYREQUEST>",
+    "<TYPE>Collection</TYPE>",
+    "<ID>SyncVoucherHeaders</ID>",
+    "</HEADER>",
+    "<BODY>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    `<SVCURRENTCOMPANY>${company.replace(/&/g, "&amp;")}</SVCURRENTCOMPANY>`,
+    "</STATICVARIABLES>",
+    "<TDL>",
+    "<TDLMESSAGE>",
+    '<COLLECTION NAME="SyncVoucherHeaders" ISINITIALIZE="Yes">',
+    "<TYPE>Voucher</TYPE>",
+    "<FILTER>OnlySalesOrPurchase</FILTER>",
+    "<FETCH>DATE</FETCH>",
+    "<FETCH>VOUCHERTYPENAME</FETCH>",
+    "<FETCH>VOUCHERNUMBER</FETCH>",
+    "<FETCH>PARTYLEDGERNAME</FETCH>",
+    "<FETCH>GUID</FETCH>",
+    "</COLLECTION>",
+    '<SYSTEM TYPE="Formulae" NAME="OnlySalesOrPurchase">$VoucherTypeName = "Sales" OR $VoucherTypeName = "Purchase"</SYSTEM>',
+    "</TDLMESSAGE>",
+    "</TDL>",
+    "</DESC>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+}
+
+function buildVoucherItemsBatchXml({ company = TALLY_COMPANY, guids }) {
+  const condition = guids.map((g) => `$Guid = "${g}"`).join(" OR ");
+  return [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>Export</TALLYREQUEST>",
+    "<TYPE>Collection</TYPE>",
+    "<ID>SyncVoucherItemsBatch</ID>",
+    "</HEADER>",
+    "<BODY>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    `<SVCURRENTCOMPANY>${company.replace(/&/g, "&amp;")}</SVCURRENTCOMPANY>`,
+    "</STATICVARIABLES>",
+    "<TDL>",
+    "<TDLMESSAGE>",
+    '<COLLECTION NAME="SyncVoucherItemsBatch" ISINITIALIZE="Yes">',
+    "<TYPE>Voucher</TYPE>",
+    "<FILTER>GuidInBatch</FILTER>",
+    "<FETCH>GUID</FETCH>",
+    "<FETCH>ALLINVENTORYENTRIES.LIST</FETCH>",
+    "</COLLECTION>",
+    `<SYSTEM TYPE="Formulae" NAME="GuidInBatch">${condition}</SYSTEM>`,
+    "</TDLMESSAGE>",
+    "</TDL>",
+    "</DESC>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+}
+
+function parseVoucherHeaders(xmlBody) {
+  const voucherBlocks = xmlBody.match(/<VOUCHER[^>]*>[\s\S]*?<\/VOUCHER>/g) || [];
+  const out = [];
+  for (const block of voucherBlocks) {
+    const guid = (block.match(/<GUID>([\s\S]*?)<\/GUID>/) || [])[1];
+    const voucherType = (block.match(/<VOUCHERTYPENAME>([\s\S]*?)<\/VOUCHERTYPENAME>/) || [])[1];
+    const voucherNumber = (block.match(/<VOUCHERNUMBER>([\s\S]*?)<\/VOUCHERNUMBER>/) || [])[1];
+    const party = (block.match(/<PARTYLEDGERNAME[^>]*>([\s\S]*?)<\/PARTYLEDGERNAME>/) || [])[1];
+    const dateRaw = (block.match(/<DATE[^>]*>([\s\S]*?)<\/DATE>/) || [])[1];
+    if (!guid || !voucherType) continue;
+    out.push({
+      guid, voucherType, voucherNumber: voucherNumber || "", party: (party || "").trim(),
+      date: dateRaw ? `${dateRaw.slice(0, 4)}-${dateRaw.slice(4, 6)}-${dateRaw.slice(6, 8)}` : "",
+    });
+  }
+  return out;
+}
+
+function parseVoucherItemsOnly(xmlBody) {
+  const voucherBlocks = xmlBody.match(/<VOUCHER[^>]*>[\s\S]*?<\/VOUCHER>/g) || [];
+  const map = {};
+  for (const block of voucherBlocks) {
+    const guid = (block.match(/<GUID>([\s\S]*?)<\/GUID>/) || [])[1];
+    if (!guid) continue;
+    const entryBlocks = block.match(/<ALLINVENTORYENTRIES\.LIST>[\s\S]*?<\/ALLINVENTORYENTRIES\.LIST>/g) || [];
+    const items = [];
+    for (const entry of entryBlocks) {
+      const beforeBatch = entry.split("<BATCHALLOCATIONS.LIST>")[0];
+      const stockItemName = (beforeBatch.match(/<STOCKITEMNAME[^>]*>([\s\S]*?)<\/STOCKITEMNAME>/) || [])[1];
+      const qtyStr = (beforeBatch.match(/<ACTUALQTY[^>]*>([\s\S]*?)<\/ACTUALQTY>/) || [])[1];
+      if (!stockItemName) continue;
+      const qty = parseTallyQty(qtyStr);
+      if (qty > 0) items.push({ stockItemName: stockItemName.trim(), qty });
+    }
+    map[guid] = items;
+  }
+  return map;
+}
+
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+// The main entry point the sync endpoints use: every voucher not already
+// synced, each with its item lines filled in via small batched requests.
+async function fetchNewVouchersWithItems(alreadySyncedGuids) {
+  const already = new Set(alreadySyncedGuids);
+  const headersBody = await queryTally(buildVoucherHeadersXml({}));
+  const headers = parseVoucherHeaders(headersBody);
+  const newHeaders = headers.filter((h) => !already.has(h.guid));
+  const batches = chunkArray(newHeaders, 20);
+  const itemsMap = {};
+  for (const batch of batches) {
+    const body = await queryTally(buildVoucherItemsBatchXml({ guids: batch.map((h) => h.guid) }));
+    Object.assign(itemsMap, parseVoucherItemsOnly(body));
+  }
+  return newHeaders.map((h) => ({ ...h, items: itemsMap[h.guid] || [] }));
+}
+
 // Temporary diagnostic: checks whether THIS SERVER (i.e. Render, not your
 // browser/laptop) can open a raw TCP connection to the Tally cloud server's
 // ODBC port. Visit this URL directly in a browser to test it — it needs no
@@ -652,16 +790,11 @@ app.get("/api/tally-voucher-items-test", (req, res) => {
 // run as often as you like; visit directly in a browser. ?from=YYYYMMDD to
 // override the default (company start, 1-Apr-2026).
 app.get("/api/tally-sync-preview", async (req, res) => {
-  const from = String(req.query.from || "20260401");
-  const to = String(req.query.to || new Date().toISOString().slice(0, 10).replace(/-/g, ""));
   try {
-    const xml = buildVoucherQueryXml({ from, to });
-    const body = await queryTally(xml);
-    const lineError = (body.match(/<LINEERROR>([\s\S]*?)<\/LINEERROR>/) || [])[1] || null;
-    const vouchers = parseTallyVouchers(body);
     const data = readData();
+    const vouchers = await fetchNewVouchersWithItems(data.tallySyncedVoucherGuids);
     const plan = computeSyncPlan(data, vouchers, { apply: false });
-    res.json({ ok: true, from, to, tallyLineError: lineError, rawResponseLength: body.length, ...plan });
+    res.json({ ok: true, totalHeadersFetched: vouchers.length, ...plan });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
@@ -677,16 +810,13 @@ app.post("/api/tally-sync-run", async (req, res) => {
   const data0 = readData();
   const member = verifyToken(token, data0);
   if (!member || member.role !== "owner") return res.status(403).json({ error: "Owner only — log in and try again from the Dashboard." });
-  const from = String((req.query && req.query.from) || "20260401");
-  const to = String((req.query && req.query.to) || new Date().toISOString().slice(0, 10).replace(/-/g, ""));
   try {
-    const xml = buildVoucherQueryXml({ from, to });
-    const body = await queryTally(xml);
-    const vouchers = parseTallyVouchers(body);
+    const data0b = readData();
+    const vouchers = await fetchNewVouchersWithItems(data0b.tallySyncedVoucherGuids);
     const result = await withData((data) => {
       const plan = computeSyncPlan(data, vouchers, { apply: true });
       const logEntry = {
-        id: newId("tsync"), at: nowIso(), by: member.name, from, to,
+        id: newId("tsync"), at: nowIso(), by: member.name,
         newVouchersFound: plan.newVouchersFound, purchasesApplied: plan.purchases.length,
         salesApplied: plan.sales.length, unmatchedCount: plan.unmatched.length,
       };
@@ -694,7 +824,7 @@ app.post("/api/tally-sync-run", async (req, res) => {
       if (data.tallySyncLog.length > 200) data.tallySyncLog.length = 200;
       return plan;
     });
-    res.json({ ok: true, from, to, ...result });
+    res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
