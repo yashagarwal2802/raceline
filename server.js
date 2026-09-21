@@ -657,10 +657,11 @@ app.get("/api/tally-sync-preview", async (req, res) => {
   try {
     const xml = buildVoucherQueryXml({ from, to });
     const body = await queryTally(xml);
+    const lineError = (body.match(/<LINEERROR>([\s\S]*?)<\/LINEERROR>/) || [])[1] || null;
     const vouchers = parseTallyVouchers(body);
     const data = readData();
     const plan = computeSyncPlan(data, vouchers, { apply: false });
-    res.json({ ok: true, from, to, ...plan });
+    res.json({ ok: true, from, to, tallyLineError: lineError, rawResponseLength: body.length, ...plan });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
