@@ -530,6 +530,149 @@ app.get("/api/tally-match-test", async (req, res) => {
   }
 });
 
+// ---------- Tally catalog baseline sync ----------
+// Yash confirmed that Tally's more specific item names (clearance-class
+// codes like /C3, pack-size notes like "(PACK 56PC)") are genuinely
+// different products, not the same part written differently — so instead
+// of loosening the match, RaceLine's product list needs an entry for each
+// exact Tally stock item name. This seeds/updates that list directly from
+// Tally's own stock item master (name + current closing balance — the
+// actual real-time stock number Tally has on file right now), so every
+// item lines up exactly for future voucher syncing.
+function buildStockItemsXml({ company = TALLY_COMPANY } = {}) {
+  return [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>Export</TALLYREQUEST>",
+    "<TYPE>Collection</TYPE>",
+    "<ID>FullStockItems</ID>",
+    "</HEADER>",
+    "<BODY>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    `<SVCURRENTCOMPANY>${company.replace(/&/g, "&amp;")}</SVCURRENTCOMPANY>`,
+    "</STATICVARIABLES>",
+    "<TDL>",
+    "<TDLMESSAGE>",
+    '<COLLECTION NAME="FullStockItems" ISINITIALIZE="Yes">',
+    "<TYPE>StockItem</TYPE>",
+    "<FETCH>NAME</FETCH>",
+    "<FETCH>CLOSINGBALANCE</FETCH>",
+    "</COLLECTION>",
+    "</TDLMESSAGE>",
+    "</TDL>",
+    "</DESC>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+}
+
+function parseStockItems(xmlBody) {
+  const blocks = xmlBody.match(/<STOCKITEM[^>]*>[\s\S]*?<\/STOCKITEM>/g) || [];
+  const out = [];
+  for (const block of blocks) {
+    const name = (block.match(/<NAME>([\s\S]*?)<\/NAME>/) || [])[1];
+    const balRaw = (block.match(/<CLOSINGBALANCE>([\s\S]*?)<\/CLOSINGBALANCE>/) || [])[1];
+    if (!name) continue;
+    out.push({ name: name.trim(), closingBalance: parseTallyQty(balRaw) });
+  }
+  return out;
+}
+
+function computeCatalogPlan(data, stockItems) {
+  const norm = (s) => String(s || "").trim().toUpperCase();
+  const newProducts = [];
+  const stockChanges = [];
+  for (const item of stockItems) {
+    const existing = data.products.find((p) => norm(p.partNumber) === norm(item.name));
+    if (!existing) newProducts.push({ partNumber: item.name, stock: item.closingBalance });
+    else if (Number(existing.stock) !== item.closingBalance) {
+      stockChanges.push({ partNumber: existing.partNumber, stockBefore: existing.stock, stockAfter: item.closingBalance });
+    }
+  }
+  return { totalTallyItems: stockItems.length, newProducts, stockChanges };
+}
+
+// Dry run — shows exactly what the catalog baseline sync would do (how many
+// brand-new products it would create, how many existing stock numbers it
+// would correct) without changing anything. Safe to run anytime.
+app.get("/api/tally-catalog-preview", async (req, res) => {
+  try {
+    const body = await queryTally(buildStockItemsXml({}));
+    const stockItems = parseStockItems(body);
+    const data = readData();
+    const plan = computeCatalogPlan(data, stockItems);
+    res.json({
+      ok: true,
+      totalTallyItems: plan.totalTallyItems,
+      newProductsCount: plan.newProducts.length,
+      stockChangesCount: plan.stockChanges.length,
+      newProductsSample: plan.newProducts.slice(0, 20),
+      stockChangesSample: plan.stockChanges.slice(0, 20),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+// Actually applies the catalog baseline: creates a RaceLine product for
+// every Tally stock item that doesn't already have one (using Tally's exact
+// name as the part number), and corrects the stock number on every existing
+// product to match Tally's current closing balance. Also marks every
+// Purchase/Sales voucher that exists in Tally right now as already synced —
+// their effect is already baked into today's closing balance, so the
+// regular voucher sync should only apply vouchers created after this point,
+// never these. Owner only, since it changes real stock for many items.
+app.post("/api/tally-catalog-sync", async (req, res) => {
+  const token = req.header("X-Raceline-Token");
+  const data0 = readData();
+  const member = verifyToken(token, data0);
+  if (!member || member.role !== "owner") return res.status(403).json({ error: "Owner only — log in and try again from the Dashboard." });
+  try {
+    const stockBody = await queryTally(buildStockItemsXml({}));
+    const stockItems = parseStockItems(stockBody);
+    const headersBody = await queryTally(buildVoucherHeadersXml({}));
+    const allHeaderGuids = parseVoucherHeaders(headersBody).map((h) => h.guid);
+    const result = await withData((data) => {
+      const norm = (s) => String(s || "").trim().toUpperCase();
+      let created = 0;
+      let updated = 0;
+      for (const item of stockItems) {
+        const existing = data.products.find((p) => norm(p.partNumber) === norm(item.name));
+        if (!existing) {
+          data.products.push(normalizeProduct({ partNumber: item.name, description: item.name, unit: "pcs", stock: item.closingBalance }));
+          created += 1;
+        } else if (Number(existing.stock) !== item.closingBalance) {
+          existing.stock = item.closingBalance;
+          existing.sample = false;
+          updated += 1;
+        }
+      }
+      const already = new Set(data.tallySyncedVoucherGuids);
+      let markedSynced = 0;
+      for (const guid of allHeaderGuids) {
+        if (!already.has(guid)) {
+          data.tallySyncedVoucherGuids.push(guid);
+          markedSynced += 1;
+        }
+      }
+      const logEntry = {
+        id: newId("tsync"), at: nowIso(), by: member.name,
+        newVouchersFound: 0, purchasesApplied: 0, salesApplied: 0, unmatchedCount: 0,
+        note: `Catalog baseline sync: ${created} new products created, ${updated} stock numbers corrected, ${markedSynced} existing vouchers marked as already reflected in today's balances.`,
+      };
+      data.tallySyncLog.unshift(logEntry);
+      if (data.tallySyncLog.length > 200) data.tallySyncLog.length = 200;
+      return { created, updated, markedSynced, totalTallyItems: stockItems.length };
+    });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
 // Diagnostic: tries fetching item-level detail for the same first group of
 // not-yet-synced vouchers using several different batch sizes (2, 5, 10, 20),
 // and reports how many of each batch actually came back with items filled
