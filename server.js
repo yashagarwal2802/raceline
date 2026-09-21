@@ -220,17 +220,32 @@ app.get("/api/tally-companies-test", (req, res) => {
   const host = String(req.query.host || "v60020.22164.tallyprimecloud.in");
   const port = Number(req.query.port) || 9537;
   const http = require("http");
+  // "List of Companies" isn't a built-in report name in this Tally version —
+  // this instead defines a small inline TDL collection asking Tally to list
+  // every object of type "Company" it has open, which is the reliable way
+  // to do this across Tally versions.
   const xmlRequest = [
     "<ENVELOPE>",
     "<HEADER>",
-    "<TALLYREQUEST>Export Data</TALLYREQUEST>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>Export</TALLYREQUEST>",
+    "<TYPE>Collection</TYPE>",
+    "<ID>ListOfCompanies</ID>",
     "</HEADER>",
     "<BODY>",
-    "<EXPORTDATA>",
-    "<REQUESTDESC>",
-    "<REPORTNAME>List of Companies</REPORTNAME>",
-    "</REQUESTDESC>",
-    "</EXPORTDATA>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    "</STATICVARIABLES>",
+    "<TDL>",
+    "<TDLMESSAGE>",
+    '<COLLECTION NAME="ListOfCompanies" ISINITIALIZE="Yes">',
+    "<TYPE>Company</TYPE>",
+    "<FETCH>NAME</FETCH>",
+    "</COLLECTION>",
+    "</TDLMESSAGE>",
+    "</TDL>",
+    "</DESC>",
     "</BODY>",
     "</ENVELOPE>",
   ].join("");
