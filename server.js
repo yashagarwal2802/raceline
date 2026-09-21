@@ -446,8 +446,29 @@ function chunkArray(arr, size) {
   return out;
 }
 
+// Runs an async worker over a list with at most `limit` requests to Tally
+// in flight at once — used for the individual-voucher retry pass below so
+// it doesn't take forever if many vouchers need it, without hammering the
+// Tally server with 100+ simultaneous connections either.
+async function runWithConcurrency(items, limit, worker) {
+  let idx = 0;
+  async function next() {
+    while (idx < items.length) {
+      const i = idx++;
+      await worker(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, next));
+}
+
 // The main entry point the sync endpoints use: every voucher not already
 // synced, each with its item lines filled in via small batched requests.
+// Tally's batched item export has occasionally (not always — seen once out
+// of several tests) come back with items missing for vouchers that do have
+// them, for reasons that were never fully pinned down. As a safety net,
+// anything that comes back empty from the batch pass gets double-checked
+// with its own individual request before being accepted as genuinely
+// item-less, so an intermittent Tally hiccup can't silently under-count.
 async function fetchNewVouchersWithItems(alreadySyncedGuids) {
   const already = new Set(alreadySyncedGuids);
   const headersBody = await queryTally(buildVoucherHeadersXml({}));
@@ -459,7 +480,20 @@ async function fetchNewVouchersWithItems(alreadySyncedGuids) {
     const body = await queryTally(buildVoucherItemsBatchXml({ guids: batch.map((h) => h.guid) }));
     Object.assign(itemsMap, parseVoucherItemsOnly(body));
   }
-  return newHeaders.map((h) => ({ ...h, items: itemsMap[h.guid] || [] }));
+  const missing = newHeaders.filter((h) => !(itemsMap[h.guid] && itemsMap[h.guid].length > 0));
+  if (missing.length > 0) {
+    await runWithConcurrency(missing, 5, async (h) => {
+      try {
+        const body = await queryTally(buildVoucherItemsBatchXml({ guids: [h.guid] }));
+        const single = parseVoucherItemsOnly(body);
+        if (single[h.guid] && single[h.guid].length > 0) itemsMap[h.guid] = single[h.guid];
+      } catch (e) {
+        // Leave it as empty — the sync will show it as an item-less
+        // voucher rather than silently drop it or crash the whole sync.
+      }
+    });
+  }
+  return newHeaders.map((h) => ({ ...h, items: itemsMap[h.guid] || [], itemsNeededRetry: missing.some((m) => m.guid === h.guid) }));
 }
 
 // Diagnostic: tries fetching item-level detail for the same first group of
@@ -821,8 +855,9 @@ app.get("/api/tally-sync-preview", async (req, res) => {
   try {
     const data = readData();
     const vouchers = await fetchNewVouchersWithItems(data.tallySyncedVoucherGuids);
+    const neededRetryCount = vouchers.filter((v) => v.itemsNeededRetry).length;
     const plan = computeSyncPlan(data, vouchers, { apply: false });
-    res.json({ ok: true, totalHeadersFetched: vouchers.length, ...plan });
+    res.json({ ok: true, totalHeadersFetched: vouchers.length, neededRetryCount, ...plan });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
