@@ -7,6 +7,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const net = require("net");
 const multer = require("multer");
 const XLSX = require("xlsx");
 
@@ -43,12 +44,34 @@ if (!fs.existsSync(DATA_FILE)) {
   fs.copyFileSync(SEED_FILE, DATA_FILE);
 }
 
+// One-time auth secret bootstrap. Generated once and saved into the data
+// file so login tokens stay valid across server restarts/redeploys — this
+// runs a single time at startup, never inside readData() (which runs on
+// every request), otherwise every token would be invalidated constantly.
+(function ensureAuthSecret() {
+  const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+  if (!raw.authSecret) {
+    raw.authSecret = crypto.randomBytes(32).toString("hex");
+    fs.writeFileSync(DATA_FILE, JSON.stringify(raw, null, 2));
+  }
+})();
+
 function readData() {
   const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
   // Backfill for data files saved before "other supplier" purchases existed.
   if (!Array.isArray(data.otherRequests)) data.otherRequests = [];
   if (!Array.isArray(data.otherStockIns)) data.otherStockIns = [];
   if (!Array.isArray(data.otherWriteOffs)) data.otherWriteOffs = [];
+  // Backfill per-person login fields for team members saved before PIN
+  // login existed.
+  for (const m of data.team || []) {
+    if (m.pinHash === undefined) m.pinHash = null;
+    if (m.pinSalt === undefined) m.pinSalt = null;
+    if (m.deviceId === undefined) m.deviceId = null;
+    if (m.pendingDeviceId === undefined) m.pendingDeviceId = null;
+    if (m.pendingDeviceRequestedAt === undefined) m.pendingDeviceRequestedAt = null;
+    if (typeof m.sessionVersion !== "number") m.sessionVersion = 1;
+  }
   return data;
 }
 
@@ -77,12 +100,170 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-// Whole shared state in one call — dataset is small, polling this is cheap.
-app.get("/api/state", (req, res) => {
-  res.json(readData());
+// ---------- login / PIN auth ----------
+// Every team member has a 6-digit PIN and is locked to one device (browser)
+// until the Owner approves a change. Sessions are stateless HMAC-signed
+// tokens that expire after 24 hours; bumping a person's sessionVersion
+// invalidates every token already issued to them (used for PIN resets,
+// device-change approval and instant "revoke access").
+
+function hashPin(pin, salt) {
+  const s = salt || crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(String(pin), s, 64).toString("hex");
+  return { hash, salt: s };
+}
+
+function pinMatches(pin, member) {
+  if (!member.pinHash || !member.pinSalt) return false;
+  const { hash } = hashPin(pin, member.pinSalt);
+  const a = Buffer.from(hash, "hex");
+  const b = Buffer.from(member.pinHash, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function signToken(memberId, issuedAt, sessionVersion, secret) {
+  const payload = `${memberId}.${issuedAt}.${sessionVersion}`;
+  const sig = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  return `${payload}.${sig}`;
+}
+
+function verifyToken(token, data) {
+  if (!token || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 4) return null;
+  const [memberId, issuedAtStr, sessionVersionStr, sig] = parts;
+  const payload = `${memberId}.${issuedAtStr}.${sessionVersionStr}`;
+  const expectedSig = crypto.createHmac("sha256", data.authSecret).update(payload).digest("hex");
+  const sigBuf = Buffer.from(sig, "hex");
+  const expBuf = Buffer.from(expectedSig, "hex");
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return null;
+  const issuedAt = Number(issuedAtStr);
+  if (!issuedAt || Date.now() - issuedAt > 24 * 60 * 60 * 1000) return null; // expired after 24h
+  const member = data.team.find((m) => m.id === memberId);
+  if (!member) return null;
+  if (member.sessionVersion !== Number(sessionVersionStr)) return null; // reset/revoked since
+  return member;
+}
+
+// What the picker/team screens are allowed to see about each person — never
+// the PIN hash/salt, device id, or the server's auth secret.
+function publicTeamMember(m) {
+  return {
+    id: m.id,
+    name: m.name,
+    role: m.role,
+    hasPin: !!m.pinHash,
+    pendingDevice: !!m.pendingDeviceId,
+    pendingDeviceRequestedAt: m.pendingDeviceRequestedAt || null,
+  };
+}
+
+function requireOwner(req, res, next) {
+  if (!req.member || req.member.role !== "owner") return res.status(403).json({ error: "Owner only." });
+  next();
+}
+
+// Temporary diagnostic: checks whether THIS SERVER (i.e. Render, not your
+// browser/laptop) can open a raw TCP connection to the Tally cloud server's
+// ODBC port. Visit this URL directly in a browser to test it — it needs no
+// login since it exposes nothing but a yes/no reachability result. Defaults
+// to the Tally-on-cloud address/port already on file; pass ?host=...&port=...
+// to test a different one.
+app.get("/api/tally-test", (req, res) => {
+  const host = String(req.query.host || "v60020.22164.tallyprimecloud.in");
+  const port = Number(req.query.port) || 9537;
+  const start = Date.now();
+  const socket = new net.Socket();
+  let settled = false;
+  const finish = (result) => {
+    if (settled) return;
+    settled = true;
+    socket.destroy();
+    res.json({ host, port, ms: Date.now() - start, ...result });
+  };
+  socket.setTimeout(8000);
+  socket.once("connect", () => finish({ ok: true, message: "Connected! Render can reach this host and port." }));
+  socket.once("timeout", () => finish({ ok: false, message: "Timed out — nothing answered. Usually means it's still blocked/firewalled from this server, or the address/port is wrong." }));
+  socket.once("error", (err) => finish({ ok: false, message: `Connection error: ${err.message}` }));
+  socket.connect(port, host);
 });
 
-app.get("/api/export", (req, res) => {
+// Shown on the picker screen before anyone is logged in — no sensitive data.
+app.get("/api/team-roster", (req, res) => {
+  const data = readData();
+  res.json({ team: data.team.map(publicTeamMember) });
+});
+
+// First-time PIN setup for a team member who doesn't have one yet (existing
+// team members created before PIN login existed, or someone newly added by
+// the Owner). Also binds this device as their one allowed device. Refuses
+// once a PIN already exists — from then on /api/login is the only way in,
+// and only the Owner can reset a PIN via /api/team/:id/pin.
+app.post("/api/team/:id/set-own-pin", async (req, res) => {
+  const { pin, deviceId } = req.body || {};
+  if (!/^\d{6}$/.test(String(pin || ""))) return res.status(400).json({ error: "PIN must be exactly 6 digits." });
+  if (!deviceId) return res.status(400).json({ error: "Missing device id." });
+  const result = await withData((data) => {
+    const m = data.team.find((t) => t.id === req.params.id);
+    if (!m) return { error: "Team member not found." };
+    if (m.pinHash) return { error: "A PIN is already set for this person. Ask the Owner to reset it if needed." };
+    const { hash, salt } = hashPin(pin);
+    m.pinHash = hash;
+    m.pinSalt = salt;
+    m.deviceId = deviceId;
+    m.sessionVersion = (m.sessionVersion || 1) + 1;
+    const token = signToken(m.id, Date.now(), m.sessionVersion, data.authSecret);
+    return { token, member: publicTeamMember(m) };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(result);
+});
+
+app.post("/api/login", async (req, res) => {
+  const { memberId, pin, deviceId } = req.body || {};
+  if (!deviceId) return res.status(400).json({ error: "Missing device id." });
+  const result = await withData((data) => {
+    const m = data.team.find((t) => t.id === memberId);
+    if (!m) return { error: "not-found" };
+    if (!m.pinHash) return { error: "no-pin" };
+    if (!pinMatches(pin, m)) return { error: "Incorrect PIN." };
+    if (!m.deviceId) {
+      m.deviceId = deviceId; // first login after a device change/reset — bind it
+    } else if (m.deviceId !== deviceId) {
+      m.pendingDeviceId = deviceId;
+      m.pendingDeviceRequestedAt = nowIso();
+      return { error: "device-pending" };
+    }
+    const token = signToken(m.id, Date.now(), m.sessionVersion, data.authSecret);
+    return { token, member: publicTeamMember(m) };
+  });
+  if (result.error === "not-found") return res.status(404).json({ error: "Team member not found." });
+  if (result.error === "no-pin") return res.status(400).json({ error: "no-pin" });
+  if (result.error === "device-pending") {
+    return res.status(403).json({ error: "device-pending", message: "This is a new device for this account. Ask the Owner to approve it from the Team tab." });
+  }
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(result);
+});
+
+// Everything below this point requires a valid, unexpired, non-revoked
+// token — attached by the client as the X-Raceline-Token header.
+app.use("/api", (req, res, next) => {
+  const data = readData();
+  const token = req.header("X-Raceline-Token");
+  const member = verifyToken(token, data);
+  if (!member) return res.status(401).json({ error: "Please log in again." });
+  req.member = member;
+  next();
+});
+
+// Whole shared state in one call — dataset is small, polling this is cheap.
+app.get("/api/state", (req, res) => {
+  const data = readData();
+  res.json({ ...data, team: data.team.map(publicTeamMember) });
+});
+
+app.get("/api/export", requireOwner, (req, res) => {
   res.setHeader("Content-Disposition", 'attachment; filename="raceline-backup.json"');
   res.json(readData());
 });
@@ -90,34 +271,43 @@ app.get("/api/export", (req, res) => {
 // Restores the whole dataset from a previously-exported backup file — used
 // to carry real data across a redeploy on a host without a persistent disk
 // (a fresh deploy resets data/data.json to the seed file).
-app.post("/api/restore", async (req, res) => {
+app.post("/api/restore", requireOwner, async (req, res) => {
   const incoming = req.body;
   if (!incoming || typeof incoming !== "object" || !Array.isArray(incoming.team) || !Array.isArray(incoming.products)) {
     return res.status(400).json({ error: "That doesn't look like a RaceLine backup file." });
   }
   await withData((data) => {
+    const keepAuthSecret = data.authSecret; // in case this is an older backup taken before PIN login existed
     for (const key of Object.keys(data)) delete data[key];
     Object.assign(data, incoming);
     if (!Array.isArray(data.otherRequests)) data.otherRequests = [];
     if (!Array.isArray(data.otherStockIns)) data.otherStockIns = [];
     if (!Array.isArray(data.otherWriteOffs)) data.otherWriteOffs = [];
+    if (!data.authSecret) data.authSecret = keepAuthSecret || crypto.randomBytes(32).toString("hex");
+    // An older backup's team members won't have PIN/device fields yet — that's
+    // fine, readData() backfills them on every read; everyone just sets a
+    // fresh PIN the next time they log in.
   });
   res.json({ ok: true });
 });
 
 // ---- team ----
-app.post("/api/team", async (req, res) => {
+app.post("/api/team", requireOwner, async (req, res) => {
   const { name, role } = req.body || {};
   if (!name || !name.trim()) return res.status(400).json({ error: "Name is required." });
   if (!["owner", "order-taker", "biller", "dispatch"].includes(role)) {
     return res.status(400).json({ error: "Invalid role." });
   }
-  const member = { id: newId("team"), name: name.trim(), role };
+  const member = {
+    id: newId("team"), name: name.trim(), role,
+    pinHash: null, pinSalt: null, deviceId: null,
+    pendingDeviceId: null, pendingDeviceRequestedAt: null, sessionVersion: 1,
+  };
   await withData((data) => data.team.push(member));
-  res.json(member);
+  res.json(publicTeamMember(member));
 });
 
-app.put("/api/team/:id", async (req, res) => {
+app.put("/api/team/:id", requireOwner, async (req, res) => {
   const { name, role } = req.body || {};
   const result = await withData((data) => {
     const m = data.team.find((t) => t.id === req.params.id);
@@ -127,14 +317,83 @@ app.put("/api/team/:id", async (req, res) => {
     return m;
   });
   if (!result) return res.status(404).json({ error: "Team member not found." });
-  res.json(result);
+  res.json(publicTeamMember(result));
 });
 
-app.delete("/api/team/:id", async (req, res) => {
+app.delete("/api/team/:id", requireOwner, async (req, res) => {
   await withData((data) => {
     data.team = data.team.filter((t) => t.id !== req.params.id);
   });
   res.json({ ok: true });
+});
+
+// Owner resets someone's PIN — also clears their device lock (so the first
+// login after a reset binds whatever device they log in from next) and
+// bumps sessionVersion so any token they already have stops working.
+app.put("/api/team/:id/pin", requireOwner, async (req, res) => {
+  const { pin } = req.body || {};
+  if (!/^\d{6}$/.test(String(pin || ""))) return res.status(400).json({ error: "PIN must be exactly 6 digits." });
+  const result = await withData((data) => {
+    const m = data.team.find((t) => t.id === req.params.id);
+    if (!m) return { error: "Team member not found." };
+    const { hash, salt } = hashPin(pin);
+    m.pinHash = hash;
+    m.pinSalt = salt;
+    m.deviceId = null;
+    m.pendingDeviceId = null;
+    m.pendingDeviceRequestedAt = null;
+    m.sessionVersion = (m.sessionVersion || 1) + 1;
+    return { member: m };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(publicTeamMember(result.member));
+});
+
+// Owner approves a pending device change — the new device becomes the one
+// allowed device, and any session on the old device is invalidated.
+app.post("/api/team/:id/approve-device", requireOwner, async (req, res) => {
+  const result = await withData((data) => {
+    const m = data.team.find((t) => t.id === req.params.id);
+    if (!m) return { error: "Team member not found." };
+    if (!m.pendingDeviceId) return { error: "No pending device request for this person." };
+    m.deviceId = m.pendingDeviceId;
+    m.pendingDeviceId = null;
+    m.pendingDeviceRequestedAt = null;
+    m.sessionVersion = (m.sessionVersion || 1) + 1;
+    return { member: m };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(publicTeamMember(result.member));
+});
+
+app.post("/api/team/:id/deny-device", requireOwner, async (req, res) => {
+  const result = await withData((data) => {
+    const m = data.team.find((t) => t.id === req.params.id);
+    if (!m) return { error: "Team member not found." };
+    m.pendingDeviceId = null;
+    m.pendingDeviceRequestedAt = null;
+    return { member: m };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(publicTeamMember(result.member));
+});
+
+// Instantly logs this person out everywhere (bumps sessionVersion so every
+// token already issued to them stops working) and clears their device lock,
+// so they'll need a fresh PIN entry — and Owner approval again if that's a
+// new device — to get back in.
+app.post("/api/team/:id/revoke", requireOwner, async (req, res) => {
+  const result = await withData((data) => {
+    const m = data.team.find((t) => t.id === req.params.id);
+    if (!m) return { error: "Team member not found." };
+    m.sessionVersion = (m.sessionVersion || 1) + 1;
+    m.deviceId = null;
+    m.pendingDeviceId = null;
+    m.pendingDeviceRequestedAt = null;
+    return { member: m };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(publicTeamMember(result.member));
 });
 
 // Orders still waiting on a part (taken = promised, billed = confirmed but
