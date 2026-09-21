@@ -271,6 +271,70 @@ app.get("/api/tally-companies-test", (req, res) => {
   request.end();
 });
 
+// Pulls a small real slice of data (stock item names) from a specific
+// company, to confirm we can query actual business data — not just company
+// names — before the real sync gets built. Visit directly in a browser;
+// pass ?company=... to test a different one, ?limit=... to see more rows.
+app.get("/api/tally-stock-test", (req, res) => {
+  const host = String(req.query.host || "v60020.22164.tallyprimecloud.in");
+  const port = Number(req.query.port) || 9537;
+  const company = String(req.query.company || "BMA - (from 1-Apr-26)");
+  const limit = Number(req.query.limit) || 25;
+  const http = require("http");
+  const xmlRequest = [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>Export</TALLYREQUEST>",
+    "<TYPE>Collection</TYPE>",
+    "<ID>StockItemsTest</ID>",
+    "</HEADER>",
+    "<BODY>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    `<SVCURRENTCOMPANY>${company.replace(/&/g, "&amp;")}</SVCURRENTCOMPANY>`,
+    "</STATICVARIABLES>",
+    "<TDL>",
+    "<TDLMESSAGE>",
+    '<COLLECTION NAME="StockItemsTest" ISINITIALIZE="Yes">',
+    "<TYPE>StockItem</TYPE>",
+    "<FETCH>NAME</FETCH>",
+    "<FETCH>CLOSINGBALANCE</FETCH>",
+    "</COLLECTION>",
+    "</TDLMESSAGE>",
+    "</TDL>",
+    "</DESC>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+  const start = Date.now();
+  const request = http.request(
+    { host, port, path: "/", method: "POST", headers: { "Content-Type": "text/xml", "Content-Length": Buffer.byteLength(xmlRequest) }, timeout: 15000 },
+    (resp) => {
+      let body = "";
+      resp.on("data", (chunk) => { body += chunk; });
+      resp.on("end", () => {
+        const matches = body.match(/<STOCKITEM[^>]*>[\s\S]*?<\/STOCKITEM>/g) || [];
+        res.json({
+          host, port, company, ms: Date.now() - start, ok: true, statusCode: resp.statusCode,
+          totalItemsFound: matches.length,
+          sample: matches.slice(0, limit).map((m) => m.replace(/\s+/g, " ").trim()),
+        });
+      });
+    }
+  );
+  request.on("timeout", () => {
+    request.destroy();
+    res.json({ host, port, company, ms: Date.now() - start, ok: false, message: "Timed out waiting for a response." });
+  });
+  request.on("error", (err) => {
+    res.json({ host, port, company, ms: Date.now() - start, ok: false, message: `Request error: ${err.message}` });
+  });
+  request.write(xmlRequest);
+  request.end();
+});
+
 // Shown on the picker screen before anyone is logged in — no sensitive data.
 app.get("/api/team-roster", (req, res) => {
   const data = readData();
