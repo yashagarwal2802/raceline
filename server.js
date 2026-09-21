@@ -62,6 +62,11 @@ function readData() {
   if (!Array.isArray(data.otherRequests)) data.otherRequests = [];
   if (!Array.isArray(data.otherStockIns)) data.otherStockIns = [];
   if (!Array.isArray(data.otherWriteOffs)) data.otherWriteOffs = [];
+  // Backfill for the Tally sync — which vouchers have already been applied
+  // to stock (by GUID, so re-running a sync never double-counts), plus a
+  // running log of what the sync has done for the Dashboard to show.
+  if (!Array.isArray(data.tallySyncedVoucherGuids)) data.tallySyncedVoucherGuids = [];
+  if (!Array.isArray(data.tallySyncLog)) data.tallySyncLog = [];
   // Backfill per-person login fields for team members saved before PIN
   // login existed.
   for (const m of data.team || []) {
@@ -161,6 +166,158 @@ function publicTeamMember(m) {
 function requireOwner(req, res, next) {
   if (!req.member || req.member.role !== "owner") return res.status(403).json({ error: "Owner only." });
   next();
+}
+
+// ---------- Tally sync ----------
+// Confirmed working setup, from testing: v60020.22164.tallyprimecloud.in:9537,
+// company "BMA - (from 1-Apr-26)". Talks to Tally's XML/HTTP gateway directly
+// (no ODBC driver needed) — a plain HTTP POST of a small TDL request.
+const TALLY_HOST = "v60020.22164.tallyprimecloud.in";
+const TALLY_PORT = 9537;
+const TALLY_COMPANY = "BMA - (from 1-Apr-26)";
+
+// Sends a Tally XML request and resolves with the raw response body.
+function queryTally(xmlRequest, { host = TALLY_HOST, port = TALLY_PORT, timeout = 20000 } = {}) {
+  const http = require("http");
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      { host, port, path: "/", method: "POST", headers: { "Content-Type": "text/xml", "Content-Length": Buffer.byteLength(xmlRequest) }, timeout },
+      (resp) => {
+        let body = "";
+        resp.on("data", (chunk) => { body += chunk; });
+        resp.on("end", () => resolve(body));
+      }
+    );
+    request.on("timeout", () => { request.destroy(); reject(new Error("Timed out waiting for Tally to respond.")); });
+    request.on("error", (err) => reject(err));
+    request.write(xmlRequest);
+    request.end();
+  });
+}
+
+// Builds the request for every Sales/Purchase voucher (with line items) in
+// a date range, for a given company.
+function buildVoucherQueryXml({ company = TALLY_COMPANY, from, to }) {
+  return [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>Export</TALLYREQUEST>",
+    "<TYPE>Collection</TYPE>",
+    "<ID>SyncVouchers</ID>",
+    "</HEADER>",
+    "<BODY>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    `<SVCURRENTCOMPANY>${company.replace(/&/g, "&amp;")}</SVCURRENTCOMPANY>`,
+    `<SVFROMDATE>${from}</SVFROMDATE>`,
+    `<SVTODATE>${to}</SVTODATE>`,
+    "</STATICVARIABLES>",
+    "<TDL>",
+    "<TDLMESSAGE>",
+    '<COLLECTION NAME="SyncVouchers" ISINITIALIZE="Yes">',
+    "<TYPE>Voucher</TYPE>",
+    "<FILTER>OnlySalesOrPurchase</FILTER>",
+    "<FETCH>DATE</FETCH>",
+    "<FETCH>VOUCHERTYPENAME</FETCH>",
+    "<FETCH>VOUCHERNUMBER</FETCH>",
+    "<FETCH>PARTYLEDGERNAME</FETCH>",
+    "<FETCH>GUID</FETCH>",
+    "<FETCH>ALLINVENTORYENTRIES.LIST</FETCH>",
+    "</COLLECTION>",
+    '<SYSTEM TYPE="Formulae" NAME="OnlySalesOrPurchase">$VoucherTypeName = "Sales" OR $VoucherTypeName = "Purchase"</SYSTEM>',
+    "</TDLMESSAGE>",
+    "</TDL>",
+    "</DESC>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+}
+
+// Pulls the leading number out of Tally's compound quantity strings, e.g.
+// " 6 NOS = 0 Box" -> 6, "-3 NOS" -> 3 (direction comes from voucher type,
+// not the sign here, since Tally's +/- convention varies by voucher/config).
+function parseTallyQty(qtyStr) {
+  const m = String(qtyStr || "").match(/(-?[\d.]+)/);
+  return m ? Math.abs(parseFloat(m[1])) : 0;
+}
+
+// Turns Tally's raw XML into a plain-JS list of vouchers with their line
+// items. Deliberately simple regex parsing rather than a full XML parser —
+// Tally's export is flat enough that this is reliable and needs no new
+// dependency; the one wrinkle (BATCHALLOCATIONS.LIST repeating the same
+// qty/rate fields inside each inventory entry) is handled by only reading
+// up to the first BATCHALLOCATIONS.LIST marker, since the entry's own
+// top-level fields always appear before it.
+function parseTallyVouchers(xmlBody) {
+  const voucherBlocks = xmlBody.match(/<VOUCHER[^>]*>[\s\S]*?<\/VOUCHER>/g) || [];
+  const vouchers = [];
+  for (const block of voucherBlocks) {
+    const guid = (block.match(/<GUID>([\s\S]*?)<\/GUID>/) || [])[1];
+    const voucherType = (block.match(/<VOUCHERTYPENAME>([\s\S]*?)<\/VOUCHERTYPENAME>/) || [])[1];
+    const voucherNumber = (block.match(/<VOUCHERNUMBER>([\s\S]*?)<\/VOUCHERNUMBER>/) || [])[1];
+    const party = (block.match(/<PARTYLEDGERNAME[^>]*>([\s\S]*?)<\/PARTYLEDGERNAME>/) || [])[1];
+    const dateRaw = (block.match(/<DATE[^>]*>([\s\S]*?)<\/DATE>/) || [])[1]; // YYYYMMDD
+    if (!guid || !voucherType) continue;
+    const entryBlocks = block.match(/<ALLINVENTORYENTRIES\.LIST>[\s\S]*?<\/ALLINVENTORYENTRIES\.LIST>/g) || [];
+    const items = [];
+    for (const entry of entryBlocks) {
+      const beforeBatch = entry.split("<BATCHALLOCATIONS.LIST>")[0];
+      const stockItemName = (beforeBatch.match(/<STOCKITEMNAME[^>]*>([\s\S]*?)<\/STOCKITEMNAME>/) || [])[1];
+      const qtyStr = (beforeBatch.match(/<ACTUALQTY[^>]*>([\s\S]*?)<\/ACTUALQTY>/) || [])[1];
+      if (!stockItemName) continue;
+      const qty = parseTallyQty(qtyStr);
+      if (qty > 0) items.push({ stockItemName: stockItemName.trim(), qty });
+    }
+    vouchers.push({
+      guid, voucherType, voucherNumber: voucherNumber || "", party: (party || "").trim(),
+      date: dateRaw ? `${dateRaw.slice(0, 4)}-${dateRaw.slice(4, 6)}-${dateRaw.slice(6, 8)}` : "",
+      items,
+    });
+  }
+  return vouchers;
+}
+
+// Matches a Tally stock item name to a RaceLine product by exact part
+// number (case/whitespace insensitive) — RaceLine's catalog was originally
+// imported from Tally, so names should line up directly.
+function findProductForStockItem(data, stockItemName) {
+  const norm = (s) => String(s || "").trim().toUpperCase();
+  return data.products.find((p) => norm(p.partNumber) === norm(stockItemName)) || null;
+}
+
+// The core of the sync: for a set of parsed vouchers not yet applied,
+// works out (but does not apply, unless apply=true) what would change.
+function computeSyncPlan(data, vouchers, { apply } = {}) {
+  const already = new Set(data.tallySyncedVoucherGuids);
+  const newVouchers = vouchers.filter((v) => !already.has(v.guid));
+  const purchases = [];
+  const sales = [];
+  const unmatched = [];
+  for (const v of newVouchers) {
+    const lineResults = [];
+    for (const item of v.items) {
+      const product = findProductForStockItem(data, item.stockItemName);
+      if (!product) {
+        unmatched.push({ voucherType: v.voucherType, voucherNumber: v.voucherNumber, stockItemName: item.stockItemName, qty: item.qty });
+        continue;
+      }
+      const direction = v.voucherType === "Purchase" ? 1 : -1;
+      const before = product.stock;
+      const after = v.voucherType === "Purchase" ? before + item.qty : Math.max(0, before - item.qty);
+      lineResults.push({ partNumber: product.partNumber, description: product.description, qty: item.qty, stockBefore: before, stockAfter: after });
+      if (apply) {
+        product.stock = after;
+        product.sample = false;
+      }
+    }
+    const entry = { guid: v.guid, voucherType: v.voucherType, voucherNumber: v.voucherNumber, party: v.party, date: v.date, items: lineResults };
+    if (v.voucherType === "Purchase") purchases.push(entry);
+    else sales.push(entry);
+    if (apply) data.tallySyncedVoucherGuids.push(v.guid);
+  }
+  return { totalVouchersChecked: vouchers.length, newVouchersFound: newVouchers.length, purchases, sales, unmatched };
 }
 
 // Temporary diagnostic: checks whether THIS SERVER (i.e. Render, not your
@@ -482,6 +639,60 @@ app.get("/api/tally-voucher-items-test", (req, res) => {
   });
   request.write(xmlRequest);
   request.end();
+});
+
+// Shows exactly what the real sync WOULD do, without changing any RaceLine
+// data — every Purchase/Sales voucher not yet synced, matched against the
+// product catalog, with the stock change each line would cause and a list
+// of any stock item names that don't match a RaceLine part number. Safe to
+// run as often as you like; visit directly in a browser. ?from=YYYYMMDD to
+// override the default (company start, 1-Apr-2026).
+app.get("/api/tally-sync-preview", async (req, res) => {
+  const from = String(req.query.from || "20260401");
+  const to = String(req.query.to || new Date().toISOString().slice(0, 10).replace(/-/g, ""));
+  try {
+    const xml = buildVoucherQueryXml({ from, to });
+    const body = await queryTally(xml);
+    const vouchers = parseTallyVouchers(body);
+    const data = readData();
+    const plan = computeSyncPlan(data, vouchers, { apply: false });
+    res.json({ ok: true, from, to, ...plan });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+// Actually applies the sync: increases stock for new Purchase vouchers,
+// decreases it for new Sales vouchers, and remembers which voucher GUIDs
+// have been applied so re-running this never double-counts. Owner only,
+// since it changes real stock. Run /api/tally-sync-preview first to check
+// the plan looks right.
+app.post("/api/tally-sync-run", async (req, res) => {
+  const token = req.header("X-Raceline-Token");
+  const data0 = readData();
+  const member = verifyToken(token, data0);
+  if (!member || member.role !== "owner") return res.status(403).json({ error: "Owner only — log in and try again from the Dashboard." });
+  const from = String((req.query && req.query.from) || "20260401");
+  const to = String((req.query && req.query.to) || new Date().toISOString().slice(0, 10).replace(/-/g, ""));
+  try {
+    const xml = buildVoucherQueryXml({ from, to });
+    const body = await queryTally(xml);
+    const vouchers = parseTallyVouchers(body);
+    const result = await withData((data) => {
+      const plan = computeSyncPlan(data, vouchers, { apply: true });
+      const logEntry = {
+        id: newId("tsync"), at: nowIso(), by: member.name, from, to,
+        newVouchersFound: plan.newVouchersFound, purchasesApplied: plan.purchases.length,
+        salesApplied: plan.sales.length, unmatchedCount: plan.unmatched.length,
+      };
+      data.tallySyncLog.unshift(logEntry);
+      if (data.tallySyncLog.length > 200) data.tallySyncLog.length = 200;
+      return plan;
+    });
+    res.json({ ok: true, from, to, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
 });
 
 // Shown on the picker screen before anyone is logged in — no sensitive data.
