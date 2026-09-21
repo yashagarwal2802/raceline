@@ -219,6 +219,7 @@ function buildVoucherQueryXml({ company = TALLY_COMPANY, from, to }) {
     '<COLLECTION NAME="SyncVouchers" ISINITIALIZE="Yes">',
     "<TYPE>Voucher</TYPE>",
     "<FILTER>OnlySalesOrPurchase</FILTER>",
+    "<FILTER>DateInRange</FILTER>",
     "<FETCH>DATE</FETCH>",
     "<FETCH>VOUCHERTYPENAME</FETCH>",
     "<FETCH>VOUCHERNUMBER</FETCH>",
@@ -227,6 +228,9 @@ function buildVoucherQueryXml({ company = TALLY_COMPANY, from, to }) {
     "<FETCH>ALLINVENTORYENTRIES.LIST</FETCH>",
     "</COLLECTION>",
     '<SYSTEM TYPE="Formulae" NAME="OnlySalesOrPurchase">$VoucherTypeName = "Sales" OR $VoucherTypeName = "Purchase"</SYSTEM>',
+    // A plain Voucher collection ignores SVFROMDATE/SVTODATE on its own — it
+    // needs an explicit date filter referencing those same variables.
+    '<SYSTEM TYPE="Formulae" NAME="DateInRange">$Date &gt;= ##SVFROMDATE AND $Date &lt;= ##SVTODATE</SYSTEM>',
     "</TDLMESSAGE>",
     "</TDL>",
     "</DESC>",
