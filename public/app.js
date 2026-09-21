@@ -39,28 +39,62 @@
     setTimeout(() => t.remove(), 3400);
   }
 
+  // A persistent id for this browser/device — separate from "who's logged
+  // in" (raceline_identity), and never cleared on Switch, since it's what
+  // ties a person's PIN login to one device.
+  function getDeviceId() {
+    let id = localStorage.getItem("raceline_device");
+    if (!id) {
+      id = (crypto.randomUUID ? crypto.randomUUID() : `dev-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      localStorage.setItem("raceline_device", id);
+    }
+    return id;
+  }
+
+  let authToken = localStorage.getItem("raceline_token") || null;
+
+  // A 401 means the token is missing/expired/revoked — send them back to
+  // the login screen rather than showing a confusing error.
+  function handleAuthFailure() {
+    authToken = null;
+    identityId = null;
+    localStorage.removeItem("raceline_token");
+    localStorage.removeItem("raceline_identity");
+    toast("Please log in again.", true);
+    loadRoster().then(render);
+    render();
+  }
+
   async function api(path, opts) {
+    const headers = opts?.body ? { "Content-Type": "application/json" } : {};
+    if (authToken) headers["X-Raceline-Token"] = authToken;
     const res = await fetch(path, {
       method: opts?.method || "GET",
-      headers: opts?.body ? { "Content-Type": "application/json" } : undefined,
+      headers,
       body: opts?.body ? JSON.stringify(opts.body) : undefined,
     });
+    if (res.status === 401) { handleAuthFailure(); throw new Error("Please log in again."); }
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || "Something went wrong.");
+    if (!res.ok) throw new Error(data.error || data.message || "Something went wrong.");
     return data;
   }
 
   // For uploading a real Excel file — no Content-Type header, the browser
   // sets the multipart boundary itself.
   async function apiUpload(path, formData) {
-    const res = await fetch(path, { method: "POST", body: formData });
+    const headers = {};
+    if (authToken) headers["X-Raceline-Token"] = authToken;
+    const res = await fetch(path, { method: "POST", body: formData, headers });
+    if (res.status === 401) { handleAuthFailure(); throw new Error("Please log in again."); }
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || "Something went wrong.");
+    if (!res.ok) throw new Error(data.error || data.message || "Something went wrong.");
     return data;
   }
 
   // ---------- state ----------
   let state = { team: [], products: [], customers: [], orders: [], skfRequests: [], stockIns: [], skfWriteOffs: [], otherRequests: [], otherStockIns: [], otherWriteOffs: [] };
+  let roster = []; // unauthenticated team-roster list, shown on the login picker
+  let pickerStage = null; // null | { member, mode: "enter-pin" | "set-pin", error }
   let identityId = localStorage.getItem("raceline_identity") || null;
   let activeTab = null;
   let cart = [];
@@ -128,6 +162,16 @@
     }
   }
 
+  // Unauthenticated — just names/roles, shown on the picker before login.
+  async function loadRoster() {
+    try {
+      const fresh = await fetch("/api/team-roster").then((r) => r.json());
+      roster = fresh.team || [];
+    } catch (e) {
+      // picker will just show "no team members" until the next poll succeeds
+    }
+  }
+
   function isEditingSomething() {
     const active = document.activeElement;
     const main = $("main") || $("#app");
@@ -152,9 +196,49 @@
     app.appendChild(renderShell(person));
   }
 
+  // ---------- login ----------
+  // A plain POST that returns the parsed body either way, so the PIN screen
+  // can react to specific error codes (no-pin, device-pending) instead of
+  // just showing a generic failure message.
+  async function rawApi(path, body) {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, data };
+  }
+
+  async function completeLogin(token, member) {
+    authToken = token;
+    identityId = member.id;
+    localStorage.setItem("raceline_token", token);
+    localStorage.setItem("raceline_identity", identityId);
+    pickerStage = null;
+    activeTab = null;
+    ordersFilter = null;
+    await loadState({ silent: true });
+    render();
+  }
+
+  function logout() {
+    authToken = null;
+    identityId = null;
+    localStorage.removeItem("raceline_token");
+    localStorage.removeItem("raceline_identity");
+    pickerStage = null;
+    loadRoster().then(render);
+    render();
+  }
+
   // ---------- identity picker ----------
   function renderPicker() {
     const wrap = el(`<div class="picker-wrap"></div>`);
+    if (pickerStage) {
+      wrap.appendChild(renderPinCard());
+      return wrap;
+    }
     const card = el(`
       <div class="picker-card">
         <div class="brand"><span class="mark">RaceLine</span></div>
@@ -163,10 +247,10 @@
       </div>
     `);
     const grid = $(".member-grid", card);
-    if (state.team.length === 0) {
+    if (roster.length === 0) {
       grid.appendChild(el(`<div class="empty-note">No team members set up yet.</div>`));
     }
-    for (const t of state.team) {
+    for (const t of roster) {
       const btn = el(`
         <button class="member-btn" data-id="${t.id}">
           <span class="name">${esc(t.name)}</span>
@@ -174,10 +258,7 @@
         </button>
       `);
       btn.addEventListener("click", () => {
-        identityId = t.id;
-        localStorage.setItem("raceline_identity", identityId);
-        activeTab = null;
-        ordersFilter = null;
+        pickerStage = { member: t, mode: t.hasPin ? "enter-pin" : "set-pin", error: null };
         render();
       });
       grid.appendChild(btn);
@@ -185,6 +266,72 @@
     card.appendChild(el(`<div class="empty-note" style="padding-top:16px;">Don't see your name? Ask the Owner to add you under the Team tab.</div>`));
     wrap.appendChild(card);
     return wrap;
+  }
+
+  function renderPinCard() {
+    const { member, mode, error } = pickerStage;
+    const isSetup = mode === "set-pin";
+    const card = el(`
+      <div class="picker-card">
+        <div class="brand"><span class="mark">RaceLine</span></div>
+        <div class="picker-sub">${esc(member.name)} — ${isSetup ? "set your 6-digit PIN" : "enter your PIN"}</div>
+        <div class="form-grid" style="margin-top:14px;">
+          <div class="field"><label>${isSetup ? "New PIN" : "PIN"}</label><input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" id="pin-input" autofocus /></div>
+          ${isSetup ? `<div class="field"><label>Confirm PIN</label><input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" id="pin-confirm" /></div>` : ""}
+        </div>
+        ${error ? `<div class="empty-note" style="color:#c0392b;padding-top:8px;">${esc(error)}</div>` : ""}
+        <button class="btn primary" style="margin-top:12px;width:100%;" id="pin-submit">${isSetup ? "Set PIN &amp; continue" : "Log in"}</button>
+        <button class="link-btn" style="margin-top:10px;" id="pin-back">Back</button>
+      </div>
+    `);
+    $("#pin-back", card).addEventListener("click", () => {
+      pickerStage = null;
+      render();
+    });
+    const submit = async () => {
+      const pin = $("#pin-input", card).value.trim();
+      if (!/^\d{6}$/.test(pin)) {
+        pickerStage.error = "Enter the 6-digit PIN.";
+        render();
+        return;
+      }
+      if (isSetup) {
+        const confirm = $("#pin-confirm", card).value.trim();
+        if (pin !== confirm) {
+          pickerStage.error = "PINs don't match.";
+          render();
+          return;
+        }
+        const { ok, data } = await rawApi(`/api/team/${member.id}/set-own-pin`, { pin, deviceId: getDeviceId() });
+        if (!ok) {
+          pickerStage.error = data.error || "Something went wrong.";
+          render();
+          return;
+        }
+        await completeLogin(data.token, data.member);
+      } else {
+        const { ok, data } = await rawApi("/api/login", { memberId: member.id, pin, deviceId: getDeviceId() });
+        if (!ok) {
+          if (data.error === "device-pending") {
+            pickerStage.error = data.message || "This is a new device for this account. Ask the Owner to approve it from the Team tab.";
+          } else if (data.error === "no-pin") {
+            pickerStage.mode = "set-pin";
+            pickerStage.error = "No PIN set yet — choose one now.";
+          } else {
+            pickerStage.error = data.error || "Something went wrong.";
+          }
+          render();
+          return;
+        }
+        await completeLogin(data.token, data.member);
+      }
+    };
+    $("#pin-submit", card).addEventListener("click", submit);
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submit();
+    });
+    setTimeout(() => $("#pin-input", card)?.focus(), 0);
+    return card;
   }
 
   // ---------- app shell ----------
@@ -202,9 +349,7 @@
       </div>
     `);
     $("#switch-btn", topbar).addEventListener("click", () => {
-      identityId = null;
-      localStorage.removeItem("raceline_identity");
-      render();
+      logout();
     });
 
     const tabs = el(`<div class="tabs"></div>`);
@@ -302,8 +447,28 @@
     wrap.appendChild(smPanel);
 
     const backupRow = el(`<div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;"></div>`);
-    backupRow.appendChild(el(`<a class="btn small" href="/api/export" download="raceline-backup.json">Export backup (JSON)</a>`));
     if (person && person.role === "owner") {
+      // A plain <a href="/api/export"> can't carry the login token, so this
+      // fetches it through api() (which attaches the token) and downloads
+      // the result as a file instead.
+      const exportBtn = el(`<button class="btn small">Export backup (JSON)</button>`);
+      exportBtn.addEventListener("click", async () => {
+        try {
+          const backup = await api("/api/export");
+          const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = el(`<a download="raceline-backup.json"></a>`);
+          a.href = url;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        } catch (e) {
+          toast(e.message || "Could not export backup.", true);
+        }
+      });
+      backupRow.appendChild(exportBtn);
+
       const restoreInput = el(`<input type="file" accept=".json" style="display:none;" />`);
       const restoreBtn = el(`<button class="btn small ghost">Restore from backup…</button>`);
       restoreBtn.addEventListener("click", () => restoreInput.click());
@@ -330,6 +495,96 @@
       backupRow.appendChild(restoreInput);
     }
     wrap.appendChild(backupRow);
+
+    if (person && person.role === "owner") {
+      const tallyPanel = el(`<div class="panel" style="margin-top:14px;"><h2>Tally sync</h2></div>`);
+      tallyPanel.appendChild(
+        el(`<div style="font-size:13px;color:var(--ink-muted);margin-bottom:10px;">Step 1 checks what your product list in Tally looks like right now. Step 2 actually adds any missing products and fixes stock numbers to match — take an Export backup first.</div>`)
+      );
+      const catalogResult = el(`<div class="empty" style="margin-top:0;">Not checked yet.</div>`);
+      const catalogRow = el(`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px;"></div>`);
+      const catalogCheckBtn = el(`<button class="btn small ghost">1. Check product list vs Tally</button>`);
+      const catalogApplyBtn = el(`<button class="btn small" disabled>2. Apply product list update</button>`);
+      catalogRow.appendChild(catalogCheckBtn);
+      catalogRow.appendChild(catalogApplyBtn);
+
+      let lastCatalogPlan = null;
+      catalogCheckBtn.addEventListener("click", async () => {
+        catalogResult.textContent = "Checking Tally…";
+        catalogApplyBtn.disabled = true;
+        lastCatalogPlan = null;
+        try {
+          const r = await api("/api/tally-catalog-preview");
+          lastCatalogPlan = r;
+          catalogResult.textContent =
+            r.newProductsCount === 0 && r.stockChangesCount === 0
+              ? `Checked ${r.totalTallyItems} items in Tally — RaceLine's product list already matches. Nothing to apply.`
+              : `Checked ${r.totalTallyItems} items in Tally: ${r.newProductsCount} new products would be added, ${r.stockChangesCount} stock numbers would be corrected to match Tally.`;
+          catalogApplyBtn.disabled = r.newProductsCount === 0 && r.stockChangesCount === 0;
+        } catch (e) {
+          catalogResult.textContent = e.message || "Could not reach Tally.";
+        }
+      });
+
+      catalogApplyBtn.addEventListener("click", async () => {
+        if (!confirm("This adds any missing products and corrects stock numbers to match Tally right now. Make sure you've taken an Export backup first. Continue?")) return;
+        catalogResult.textContent = "Applying…";
+        catalogApplyBtn.disabled = true;
+        try {
+          const r = await api("/api/tally-catalog-sync", { method: "POST" });
+          catalogResult.textContent = `Done: ${r.created} new products added, ${r.updated} stock numbers corrected.`;
+          await loadState();
+        } catch (e) {
+          catalogResult.textContent = e.message || "Could not apply the update.";
+          catalogApplyBtn.disabled = false;
+        }
+      });
+
+      tallyPanel.appendChild(catalogRow);
+      tallyPanel.appendChild(catalogResult);
+
+      const syncResult = el(`<div class="empty" style="margin-top:10px;">Not checked yet.</div>`);
+      const syncRow = el(`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px;"></div>`);
+      const syncCheckBtn = el(`<button class="btn small ghost">3. Check for new Tally vouchers</button>`);
+      const syncApplyBtn = el(`<button class="btn small" disabled>4. Apply new vouchers to stock</button>`);
+      syncRow.appendChild(syncCheckBtn);
+      syncRow.appendChild(syncApplyBtn);
+
+      syncCheckBtn.addEventListener("click", async () => {
+        syncResult.textContent = "Checking Tally…";
+        syncApplyBtn.disabled = true;
+        try {
+          const r = await api("/api/tally-sync-preview");
+          const changeCount = r.purchases.length + r.sales.length;
+          syncResult.textContent =
+            changeCount === 0
+              ? `No new Purchase/Sales vouchers found in Tally since the last sync.`
+              : `${r.newVouchersFound} new vouchers found: ${r.purchases.length} Purchase, ${r.sales.length} Sales. ${r.unmatched.length ? r.unmatched.length + " line(s) didn't match a RaceLine part number — run the product list check above first." : "All items matched."}`;
+          syncApplyBtn.disabled = changeCount === 0;
+        } catch (e) {
+          syncResult.textContent = e.message || "Could not reach Tally.";
+        }
+      });
+
+      syncApplyBtn.addEventListener("click", async () => {
+        if (!confirm("This updates stock numbers for every new Purchase/Sales voucher found in Tally. Continue?")) return;
+        syncResult.textContent = "Applying…";
+        syncApplyBtn.disabled = true;
+        try {
+          const r = await api("/api/tally-sync-run", { method: "POST" });
+          syncResult.textContent = `Done: ${r.purchases.length} Purchase and ${r.sales.length} Sales vouchers applied to stock.`;
+          await loadState();
+        } catch (e) {
+          syncResult.textContent = e.message || "Could not apply the sync.";
+          syncApplyBtn.disabled = false;
+        }
+      });
+
+      tallyPanel.appendChild(syncRow);
+      tallyPanel.appendChild(syncResult);
+      wrap.appendChild(tallyPanel);
+    }
+
     return wrap;
   }
 
@@ -1761,16 +2016,41 @@
       const list = el(`<div class="stack"></div>`);
       state.team.forEach((t) => {
         const row = el(`
-          <div class="panel" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
-            <div><strong>${esc(t.name)}</strong> <span class="role-chip">${ROLE_LABEL[t.role]}</span></div>
-            <div style="display:flex;gap:8px;"></div>
+          <div class="panel" style="display:flex;flex-direction:column;gap:8px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+              <div>
+                <strong>${esc(t.name)}</strong> <span class="role-chip">${ROLE_LABEL[t.role]}</span>
+                <span class="empty-note" style="display:inline;">${t.hasPin ? "PIN set" : "No PIN yet"}</span>
+              </div>
+              <div class="row-actions" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+            </div>
           </div>
         `);
-        const actions = $("div > div", row) || row.lastElementChild;
+        const actions = $(".row-actions", row);
         const roleSel = el(`<select style="width:auto;">${Object.keys(ROLE_LABEL).map((r) => `<option value="${r}"${r === t.role ? " selected" : ""}>${ROLE_LABEL[r]}</option>`).join("")}</select>`);
         roleSel.addEventListener("change", async () => {
           await api(`/api/team/${t.id}`, { method: "PUT", body: { role: roleSel.value } });
           toast("Role updated.");
+          await loadState();
+        });
+        const pinBtn = el(`<button class="btn small">${t.hasPin ? "Reset PIN" : "Set PIN"}</button>`);
+        pinBtn.addEventListener("click", async () => {
+          const pin = prompt(`Enter a new 6-digit PIN for ${t.name}:`);
+          if (pin === null) return;
+          if (!/^\d{6}$/.test(pin.trim())) return toast("PIN must be exactly 6 digits.", true);
+          try {
+            await api(`/api/team/${t.id}/pin`, { method: "PUT", body: { pin: pin.trim() } });
+            toast(`PIN set for ${t.name}. They'll need to log in again.`);
+            await loadState();
+          } catch (e) {
+            toast(e.message, true);
+          }
+        });
+        const revokeBtn = el(`<button class="btn small danger">Revoke access</button>`);
+        revokeBtn.addEventListener("click", async () => {
+          if (!confirm(`Log ${t.name} out everywhere and require a fresh PIN login?`)) return;
+          await api(`/api/team/${t.id}/revoke`, { method: "POST" });
+          toast("Access revoked.");
           await loadState();
         });
         const removeBtn = el(`<button class="btn small danger">Remove</button>`);
@@ -1781,7 +2061,32 @@
           await loadState();
         });
         actions.appendChild(roleSel);
+        actions.appendChild(pinBtn);
+        if (t.hasPin) actions.appendChild(revokeBtn);
         actions.appendChild(removeBtn);
+        row.appendChild(actions);
+        if (t.pendingDevice) {
+          const pend = el(`
+            <div class="empty-note" style="background:#fff6e0;border-radius:6px;padding:8px 10px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+              <span>Trying to log in from a new device (${relTime(t.pendingDeviceRequestedAt)}). Approve to switch their allowed device, or deny to keep the old one.</span>
+              <span style="display:flex;gap:8px;">
+                <button class="btn small" id="approve-dev">Approve</button>
+                <button class="btn small danger" id="deny-dev">Deny</button>
+              </span>
+            </div>
+          `);
+          $("#approve-dev", pend).addEventListener("click", async () => {
+            await api(`/api/team/${t.id}/approve-device`, { method: "POST" });
+            toast(`Approved — ${t.name} can log in on the new device now.`);
+            await loadState();
+          });
+          $("#deny-dev", pend).addEventListener("click", async () => {
+            await api(`/api/team/${t.id}/deny-device`, { method: "POST" });
+            toast("Denied.");
+            await loadState();
+          });
+          row.appendChild(pend);
+        }
         list.appendChild(row);
       });
       bodyHolder.appendChild(list);
@@ -1825,11 +2130,19 @@
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("sw.js").catch(() => {}); // enables "Add to Home Screen"
     }
-    await loadState({ silent: true });
+    if (authToken) {
+      await loadState({ silent: true });
+    } else {
+      await loadRoster();
+    }
     render();
     setInterval(async () => {
       if (isEditingSomething()) return;
-      await loadState({ silent: true });
+      if (authToken) {
+        await loadState({ silent: true });
+      } else {
+        await loadRoster();
+      }
       render();
     }, 4000);
   }
