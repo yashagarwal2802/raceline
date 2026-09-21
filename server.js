@@ -335,6 +335,81 @@ app.get("/api/tally-stock-test", (req, res) => {
   request.end();
 });
 
+// Pulls basic Sales + Purchase voucher info (date, type, number, party —
+// not line items yet) from a company/date range, to confirm we can read
+// actual transactions before building line-item detail into the real sync.
+// Visit directly in a browser; ?company=, ?from=YYYYMMDD, ?to=YYYYMMDD.
+app.get("/api/tally-vouchers-test", (req, res) => {
+  const host = String(req.query.host || "v60020.22164.tallyprimecloud.in");
+  const port = Number(req.query.port) || 9537;
+  const company = String(req.query.company || "BMA - (from 1-Apr-26)");
+  const from = String(req.query.from || "20260401");
+  const to = String(req.query.to || new Date().toISOString().slice(0, 10).replace(/-/g, ""));
+  const http = require("http");
+  const xmlRequest = [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>Export</TALLYREQUEST>",
+    "<TYPE>Collection</TYPE>",
+    "<ID>VouchersTest</ID>",
+    "</HEADER>",
+    "<BODY>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    `<SVCURRENTCOMPANY>${company.replace(/&/g, "&amp;")}</SVCURRENTCOMPANY>`,
+    `<SVFROMDATE>${from}</SVFROMDATE>`,
+    `<SVTODATE>${to}</SVTODATE>`,
+    "</STATICVARIABLES>",
+    "<TDL>",
+    "<TDLMESSAGE>",
+    '<COLLECTION NAME="VouchersTest" ISINITIALIZE="Yes">',
+    "<TYPE>Voucher</TYPE>",
+    "<FILTER>OnlySalesOrPurchase</FILTER>",
+    "<FETCH>DATE</FETCH>",
+    "<FETCH>VOUCHERTYPENAME</FETCH>",
+    "<FETCH>VOUCHERNUMBER</FETCH>",
+    "<FETCH>PARTYLEDGERNAME</FETCH>",
+    "<FETCH>GUID</FETCH>",
+    "</COLLECTION>",
+    '<SYSTEM TYPE="Formulae" NAME="OnlySalesOrPurchase">$VoucherTypeName = "Sales" OR $VoucherTypeName = "Purchase"</SYSTEM>',
+    "</TDLMESSAGE>",
+    "</TDL>",
+    "</DESC>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+  const start = Date.now();
+  const request = http.request(
+    { host, port, path: "/", method: "POST", headers: { "Content-Type": "text/xml", "Content-Length": Buffer.byteLength(xmlRequest) }, timeout: 20000 },
+    (resp) => {
+      let body = "";
+      resp.on("data", (chunk) => { body += chunk; });
+      resp.on("end", () => {
+        const matches = body.match(/<VOUCHER[^>]*>[\s\S]*?<\/VOUCHER>/g) || [];
+        const lineError = body.match(/<LINEERROR>([\s\S]*?)<\/LINEERROR>/);
+        res.json({
+          host, port, company, from, to, ms: Date.now() - start, ok: true, statusCode: resp.statusCode,
+          lineError: lineError ? lineError[1] : null,
+          totalVouchersFound: matches.length,
+          sample: matches.slice(0, 15).map((m) => m.replace(/\s+/g, " ").trim()),
+          rawPreviewIfNoVouchers: matches.length === 0 ? body.slice(0, 3000) : undefined,
+        });
+      });
+    }
+  );
+  request.on("timeout", () => {
+    request.destroy();
+    res.json({ host, port, company, ms: Date.now() - start, ok: false, message: "Timed out waiting for a response." });
+  });
+  request.on("error", (err) => {
+    res.json({ host, port, company, ms: Date.now() - start, ok: false, message: `Request error: ${err.message}` });
+  });
+  request.write(xmlRequest);
+  request.end();
+});
+
 // Shown on the picker screen before anyone is logged in — no sensitive data.
 app.get("/api/team-roster", (req, res) => {
   const data = readData();
