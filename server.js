@@ -462,6 +462,34 @@ async function fetchNewVouchersWithItems(alreadySyncedGuids) {
   return newHeaders.map((h) => ({ ...h, items: itemsMap[h.guid] || [] }));
 }
 
+// Diagnostic: tries fetching item-level detail for the same first group of
+// not-yet-synced vouchers using several different batch sizes (2, 5, 10, 20),
+// and reports how many of each batch actually came back with items filled
+// in. This tells us the largest batch size Tally can reliably hand back
+// item detail for, so the real sync can use that number instead of guessing.
+app.get("/api/tally-batch-size-test", async (req, res) => {
+  try {
+    const data = readData();
+    const already = new Set(data.tallySyncedVoucherGuids);
+    const headersBody = await queryTally(buildVoucherHeadersXml({}));
+    const headers = parseVoucherHeaders(headersBody);
+    const newHeaders = headers.filter((h) => !already.has(h.guid));
+    const testSizes = [1, 2, 5, 10, 20];
+    const results = {};
+    for (const size of testSizes) {
+      const subset = newHeaders.slice(0, size);
+      if (subset.length === 0) continue;
+      const body = await queryTally(buildVoucherItemsBatchXml({ guids: subset.map((h) => h.guid) }));
+      const itemsMap = parseVoucherItemsOnly(body);
+      const withItems = subset.filter((h) => (itemsMap[h.guid] || []).length > 0).length;
+      results[size] = { requested: subset.length, gotItemsFor: withItems };
+    }
+    res.json({ ok: true, totalNewVouchers: newHeaders.length, results });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
 // Temporary diagnostic: checks whether THIS SERVER (i.e. Render, not your
 // browser/laptop) can open a raw TCP connection to the Tally cloud server's
 // ODBC port. Visit this URL directly in a browser to test it — it needs no
