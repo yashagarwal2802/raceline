@@ -905,6 +905,70 @@ app.get("/api/tally-stock-test", (req, res) => {
   request.end();
 });
 
+// Asks Tally for the literal names of every company it currently has open —
+// with no SVCURRENTCOMPANY filter at all, so there's nothing for us to get
+// wrong. Settles exact-name-match questions (stray spaces, dash characters)
+// without relying on reading a screenshot. Visit directly in a browser.
+app.get("/api/tally-company-list", (req, res) => {
+  const host = String(req.query.host || "v60020.22164.tallyprimecloud.in");
+  const port = Number(req.query.port) || 9537;
+  const http = require("http");
+  const xmlRequest = [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>Export</TALLYREQUEST>",
+    "<TYPE>Collection</TYPE>",
+    "<ID>CompanyListTest</ID>",
+    "</HEADER>",
+    "<BODY>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    "</STATICVARIABLES>",
+    "<TDL>",
+    "<TDLMESSAGE>",
+    '<COLLECTION NAME="CompanyListTest" ISINITIALIZE="Yes">',
+    "<TYPE>Company</TYPE>",
+    "<FETCH>NAME</FETCH>",
+    "<FETCH>STARTINGFROM</FETCH>",
+    "</COLLECTION>",
+    "</TDLMESSAGE>",
+    "</TDL>",
+    "</DESC>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+  const start = Date.now();
+  const request = http.request(
+    { host, port, path: "/", method: "POST", headers: { "Content-Type": "text/xml", "Content-Length": Buffer.byteLength(xmlRequest) }, timeout: 15000 },
+    (resp) => {
+      let body = "";
+      resp.on("data", (chunk) => { body += chunk; });
+      resp.on("end", () => {
+        const matches = body.match(/<COMPANY[^>]*>[\s\S]*?<\/COMPANY>/g) || [];
+        res.json({
+          host, port, ms: Date.now() - start, ok: true, statusCode: resp.statusCode,
+          companiesFound: matches.length,
+          rawResponseLength: body.length,
+          rawStart: body.slice(0, 1200).replace(/\s+/g, " ").trim(),
+          companies: matches.map((m) => m.replace(/\s+/g, " ").trim()),
+          weAreSendingExactly: TALLY_COMPANY,
+        });
+      });
+    }
+  );
+  request.on("timeout", () => {
+    request.destroy();
+    res.json({ host, port, ms: Date.now() - start, ok: false, message: "Timed out waiting for a response." });
+  });
+  request.on("error", (err) => {
+    res.json({ host, port, ms: Date.now() - start, ok: false, message: `Request error: ${err.message}` });
+  });
+  request.write(xmlRequest);
+  request.end();
+});
+
 // Pulls basic Sales + Purchase voucher info (date, type, number, party —
 // not line items yet) from a company/date range, to confirm we can read
 // actual transactions before building line-item detail into the real sync.
