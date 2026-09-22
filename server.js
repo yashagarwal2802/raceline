@@ -33,13 +33,24 @@ function pick(row, ...aliases) {
 }
 
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(__dirname, "data", "data.json");
+// Where the real, ever-changing data file lives. On Render's free plan
+// there's nowhere safe to keep it — everything inside the app's own folder
+// gets wiped and rebuilt from scratch on every deploy. Setting the
+// RACELINE_DATA_DIR environment variable to a mounted persistent disk (e.g.
+// on Render: Settings → Disks → add a disk, then set this variable to its
+// mount path) makes the data survive deploys instead. Left unset, it falls
+// back to the old in-app folder — fine for local testing, not for real use.
+const DATA_DIR = process.env.RACELINE_DATA_DIR || path.join(__dirname, "data");
+const DATA_FILE = path.join(DATA_DIR, "data.json");
 const SEED_FILE = path.join(__dirname, "data", "seed.json");
 
 // ---------- storage ----------
 // Plain JSON file on disk. A tiny in-process write queue keeps concurrent
 // requests from corrupting the file (no native/database dependency needed).
 
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 if (!fs.existsSync(DATA_FILE)) {
   fs.copyFileSync(SEED_FILE, DATA_FILE);
 }
