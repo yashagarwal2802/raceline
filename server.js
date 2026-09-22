@@ -1129,6 +1129,31 @@ app.post("/api/team/:id/set-own-pin", async (req, res) => {
   res.json(result);
 });
 
+// Emergency bootstrap: only works when the team list is completely empty
+// (e.g. right after a fresh deploy with no data yet) — creates the very
+// first Owner account, since the normal "Owner adds people" flow needs an
+// Owner to already exist. Refuses outright the moment any team member
+// exists, so it can't be used to sneak in a second Owner later.
+app.post("/api/bootstrap-owner", async (req, res) => {
+  const { name, pin, deviceId } = req.body || {};
+  if (!String(name || "").trim()) return res.status(400).json({ error: "Name is required." });
+  if (!/^\d{6}$/.test(String(pin || ""))) return res.status(400).json({ error: "PIN must be exactly 6 digits." });
+  if (!deviceId) return res.status(400).json({ error: "Missing device id." });
+  const result = await withData((data) => {
+    if (data.team.length > 0) return { error: "Team already set up — this can only be used once, on an empty system." };
+    const { hash, salt } = hashPin(pin);
+    const m = {
+      id: newId("team"), name: String(name).trim(), role: "owner",
+      pinHash: hash, pinSalt: salt, deviceId, pendingDeviceId: null, pendingDeviceRequestedAt: null, sessionVersion: 1,
+    };
+    data.team.push(m);
+    const token = signToken(m.id, Date.now(), m.sessionVersion, data.authSecret);
+    return { token, member: publicTeamMember(m) };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(result);
+});
+
 app.post("/api/login", async (req, res) => {
   const { memberId, pin, deviceId } = req.body || {};
   if (!deviceId) return res.status(400).json({ error: "Missing device id." });
