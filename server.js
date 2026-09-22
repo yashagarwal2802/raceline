@@ -882,9 +882,13 @@ app.get("/api/tally-stock-test", (req, res) => {
       resp.on("data", (chunk) => { body += chunk; });
       resp.on("end", () => {
         const matches = body.match(/<STOCKITEM[^>]*>[\s\S]*?<\/STOCKITEM>/g) || [];
+        const lineError = (body.match(/<LINEERROR>([\s\S]*?)<\/LINEERROR>/) || [])[1] || null;
         res.json({
           host, port, company, ms: Date.now() - start, ok: true, statusCode: resp.statusCode,
           totalItemsFound: matches.length,
+          rawResponseLength: body.length,
+          tallyLineError: lineError,
+          rawStart: body.slice(0, 600).replace(/\s+/g, " ").trim(),
           sample: matches.slice(0, limit).map((m) => m.replace(/\s+/g, " ").trim()),
         });
       });
