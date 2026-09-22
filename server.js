@@ -1162,13 +1162,13 @@ app.post("/api/login", async (req, res) => {
     if (!m) return { error: "not-found" };
     if (!m.pinHash) return { error: "no-pin" };
     if (!pinMatches(pin, m)) return { error: "Incorrect PIN." };
-    if (!m.deviceId) {
-      m.deviceId = deviceId; // first login after a device change/reset — bind it
-    } else if (m.deviceId !== deviceId) {
-      m.pendingDeviceId = deviceId;
-      m.pendingDeviceRequestedAt = nowIso();
-      return { error: "device-pending" };
-    }
+    // Device-locking (one device per person, Owner approval to switch) was
+    // removed after it locked the Owner out with no way back in — nobody
+    // could reach the approval screen without already being logged in. A
+    // correct PIN is now enough to log in from anywhere; deviceId is kept
+    // only for display, not enforced.
+    m.deviceId = deviceId;
+    m.pendingDeviceId = null;
     const token = signToken(m.id, Date.now(), m.sessionVersion, data.authSecret);
     return { token, member: publicTeamMember(m) };
   });
