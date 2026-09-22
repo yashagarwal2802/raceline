@@ -100,6 +100,12 @@
   let cart = [];
   let selectedProduct = null;
   let ordersFilter = null; // set on first entry to Orders, defaults per role
+  // Tally sync panel state on the Dashboard — kept up here (not as local
+  // variables inside renderDashboard) because the app polls the server and
+  // re-renders every few seconds; local variables would get wiped mid-check,
+  // making a result flash and disappear before it could be read.
+  let tallyCatalogState = { text: "Not checked yet.", canApply: false, busy: false };
+  let tallySyncState = { text: "Not checked yet.", canApply: false, busy: false };
   let ordersSearch = "";
   let stockSearch = "";
   let editingProductId = null;
@@ -236,7 +242,7 @@
   function renderPicker() {
     const wrap = el(`<div class="picker-wrap"></div>`);
     if (pickerStage) {
-      wrap.appendChild(renderPinCard());
+      wrap.appendChild(pickerStage.mode === "bootstrap" ? renderBootstrapCard() : renderPinCard());
       return wrap;
     }
     const card = el(`
@@ -249,6 +255,12 @@
     const grid = $(".member-grid", card);
     if (roster.length === 0) {
       grid.appendChild(el(`<div class="empty-note">No team members set up yet.</div>`));
+      const setupBtn = el(`<button class="btn primary" style="margin-top:10px;width:100%;">Set up Owner account</button>`);
+      setupBtn.addEventListener("click", () => {
+        pickerStage = { mode: "bootstrap", error: null };
+        render();
+      });
+      grid.appendChild(setupBtn);
     }
     for (const t of roster) {
       const btn = el(`
@@ -331,6 +343,64 @@
       if (e.key === "Enter") submit();
     });
     setTimeout(() => $("#pin-input", card)?.focus(), 0);
+    return card;
+  }
+
+  // Only reachable when the team list is completely empty (fresh install /
+  // right after a deploy with no data yet) — creates the very first Owner,
+  // since normally only an existing Owner can add team members.
+  function renderBootstrapCard() {
+    const { error } = pickerStage;
+    const card = el(`
+      <div class="picker-card">
+        <div class="brand"><span class="mark">RaceLine</span></div>
+        <div class="picker-sub">Set up the Owner account</div>
+        <div class="form-grid" style="margin-top:14px;">
+          <div class="field"><label>Your name</label><input type="text" id="bs-name" autofocus /></div>
+          <div class="field"><label>Choose a 6-digit PIN</label><input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" id="bs-pin" /></div>
+          <div class="field"><label>Confirm PIN</label><input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" id="bs-pin-confirm" /></div>
+        </div>
+        ${error ? `<div class="empty-note" style="color:#c0392b;padding-top:8px;">${esc(error)}</div>` : ""}
+        <button class="btn primary" style="margin-top:12px;width:100%;" id="bs-submit">Create Owner account</button>
+        <button class="link-btn" style="margin-top:10px;" id="bs-back">Back</button>
+      </div>
+    `);
+    $("#bs-back", card).addEventListener("click", () => {
+      pickerStage = null;
+      render();
+    });
+    const submit = async () => {
+      const name = $("#bs-name", card).value.trim();
+      const pin = $("#bs-pin", card).value.trim();
+      const confirm = $("#bs-pin-confirm", card).value.trim();
+      if (!name) {
+        pickerStage.error = "Enter your name.";
+        render();
+        return;
+      }
+      if (!/^\d{6}$/.test(pin)) {
+        pickerStage.error = "Enter a 6-digit PIN.";
+        render();
+        return;
+      }
+      if (pin !== confirm) {
+        pickerStage.error = "PINs don't match.";
+        render();
+        return;
+      }
+      const { ok, data } = await rawApi("/api/bootstrap-owner", { name, pin, deviceId: getDeviceId() });
+      if (!ok) {
+        pickerStage.error = data.error || "Something went wrong.";
+        render();
+        return;
+      }
+      await completeLogin(data.token, data.member);
+    };
+    $("#bs-submit", card).addEventListener("click", submit);
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submit();
+    });
+    setTimeout(() => $("#bs-name", card)?.focus(), 0);
     return card;
   }
 
@@ -501,83 +571,83 @@
       tallyPanel.appendChild(
         el(`<div style="font-size:13px;color:var(--ink-muted);margin-bottom:10px;">Step 1 checks what your product list in Tally looks like right now. Step 2 actually adds any missing products and fixes stock numbers to match — take an Export backup first.</div>`)
       );
-      const catalogResult = el(`<div class="empty" style="margin-top:0;">Not checked yet.</div>`);
+      const catalogResult = el(`<div class="empty" style="margin-top:0;">${esc(tallyCatalogState.text)}</div>`);
       const catalogRow = el(`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px;"></div>`);
-      const catalogCheckBtn = el(`<button class="btn small ghost">1. Check product list vs Tally</button>`);
-      const catalogApplyBtn = el(`<button class="btn small" disabled>2. Apply product list update</button>`);
+      const catalogCheckBtn = el(`<button class="btn small ghost"${tallyCatalogState.busy ? " disabled" : ""}>1. Check product list vs Tally</button>`);
+      const catalogApplyBtn = el(`<button class="btn small"${tallyCatalogState.canApply && !tallyCatalogState.busy ? "" : " disabled"}>2. Apply product list update</button>`);
       catalogRow.appendChild(catalogCheckBtn);
       catalogRow.appendChild(catalogApplyBtn);
 
-      let lastCatalogPlan = null;
       catalogCheckBtn.addEventListener("click", async () => {
-        catalogResult.textContent = "Checking Tally…";
-        catalogApplyBtn.disabled = true;
-        lastCatalogPlan = null;
+        tallyCatalogState = { text: "Checking Tally…", canApply: false, busy: true };
+        render();
         try {
           const r = await api("/api/tally-catalog-preview");
-          lastCatalogPlan = r;
-          catalogResult.textContent =
-            r.newProductsCount === 0 && r.stockChangesCount === 0
-              ? `Checked ${r.totalTallyItems} items in Tally — RaceLine's product list already matches. Nothing to apply.`
-              : `Checked ${r.totalTallyItems} items in Tally: ${r.newProductsCount} new products would be added, ${r.stockChangesCount} stock numbers would be corrected to match Tally.`;
-          catalogApplyBtn.disabled = r.newProductsCount === 0 && r.stockChangesCount === 0;
+          const canApply = r.newProductsCount > 0 || r.stockChangesCount > 0;
+          const text =
+            canApply
+              ? `Checked ${r.totalTallyItems} items in Tally: ${r.newProductsCount} new products would be added, ${r.stockChangesCount} stock numbers would be corrected to match Tally.`
+              : `Checked ${r.totalTallyItems} items in Tally — RaceLine's product list already matches. Nothing to apply.`;
+          tallyCatalogState = { text, canApply, busy: false };
         } catch (e) {
-          catalogResult.textContent = e.message || "Could not reach Tally.";
+          tallyCatalogState = { text: e.message || "Could not reach Tally.", canApply: false, busy: false };
         }
+        render();
       });
 
       catalogApplyBtn.addEventListener("click", async () => {
         if (!confirm("This adds any missing products and corrects stock numbers to match Tally right now. Make sure you've taken an Export backup first. Continue?")) return;
-        catalogResult.textContent = "Applying…";
-        catalogApplyBtn.disabled = true;
+        tallyCatalogState = { text: "Applying…", canApply: false, busy: true };
+        render();
         try {
           const r = await api("/api/tally-catalog-sync", { method: "POST" });
-          catalogResult.textContent = `Done: ${r.created} new products added, ${r.updated} stock numbers corrected.`;
+          tallyCatalogState = { text: `Done: ${r.created} new products added, ${r.updated} stock numbers corrected.`, canApply: false, busy: false };
           await loadState();
         } catch (e) {
-          catalogResult.textContent = e.message || "Could not apply the update.";
-          catalogApplyBtn.disabled = false;
+          tallyCatalogState = { text: e.message || "Could not apply the update.", canApply: true, busy: false };
         }
+        render();
       });
 
       tallyPanel.appendChild(catalogRow);
       tallyPanel.appendChild(catalogResult);
 
-      const syncResult = el(`<div class="empty" style="margin-top:10px;">Not checked yet.</div>`);
+      const syncResult = el(`<div class="empty" style="margin-top:10px;">${esc(tallySyncState.text)}</div>`);
       const syncRow = el(`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px;"></div>`);
-      const syncCheckBtn = el(`<button class="btn small ghost">3. Check for new Tally vouchers</button>`);
-      const syncApplyBtn = el(`<button class="btn small" disabled>4. Apply new vouchers to stock</button>`);
+      const syncCheckBtn = el(`<button class="btn small ghost"${tallySyncState.busy ? " disabled" : ""}>3. Check for new Tally vouchers</button>`);
+      const syncApplyBtn = el(`<button class="btn small"${tallySyncState.canApply && !tallySyncState.busy ? "" : " disabled"}>4. Apply new vouchers to stock</button>`);
       syncRow.appendChild(syncCheckBtn);
       syncRow.appendChild(syncApplyBtn);
 
       syncCheckBtn.addEventListener("click", async () => {
-        syncResult.textContent = "Checking Tally…";
-        syncApplyBtn.disabled = true;
+        tallySyncState = { text: "Checking Tally…", canApply: false, busy: true };
+        render();
         try {
           const r = await api("/api/tally-sync-preview");
           const changeCount = r.purchases.length + r.sales.length;
-          syncResult.textContent =
+          const text =
             changeCount === 0
               ? `No new Purchase/Sales vouchers found in Tally since the last sync.`
               : `${r.newVouchersFound} new vouchers found: ${r.purchases.length} Purchase, ${r.sales.length} Sales. ${r.unmatched.length ? r.unmatched.length + " line(s) didn't match a RaceLine part number — run the product list check above first." : "All items matched."}`;
-          syncApplyBtn.disabled = changeCount === 0;
+          tallySyncState = { text, canApply: changeCount > 0, busy: false };
         } catch (e) {
-          syncResult.textContent = e.message || "Could not reach Tally.";
+          tallySyncState = { text: e.message || "Could not reach Tally.", canApply: false, busy: false };
         }
+        render();
       });
 
       syncApplyBtn.addEventListener("click", async () => {
         if (!confirm("This updates stock numbers for every new Purchase/Sales voucher found in Tally. Continue?")) return;
-        syncResult.textContent = "Applying…";
-        syncApplyBtn.disabled = true;
+        tallySyncState = { text: "Applying…", canApply: false, busy: true };
+        render();
         try {
           const r = await api("/api/tally-sync-run", { method: "POST" });
-          syncResult.textContent = `Done: ${r.purchases.length} Purchase and ${r.sales.length} Sales vouchers applied to stock.`;
+          tallySyncState = { text: `Done: ${r.purchases.length} Purchase and ${r.sales.length} Sales vouchers applied to stock.`, canApply: false, busy: false };
           await loadState();
         } catch (e) {
-          syncResult.textContent = e.message || "Could not apply the sync.";
-          syncApplyBtn.disabled = false;
+          tallySyncState = { text: e.message || "Could not apply the sync.", canApply: true, busy: false };
         }
+        render();
       });
 
       tallyPanel.appendChild(syncRow);
